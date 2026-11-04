@@ -13,24 +13,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import minhash
+from .config import Config
 from .extract import FunctionInfo, extract_functions
 
 DEFAULT_EXCLUDE = [
     ".git/*", "*/.git/*", ".venv/*", "*/.venv/*", "venv/*", "node_modules/*", "*/node_modules/*",
     "*/__pycache__/*", "build/*", "dist/*", "*/alembic/versions/*", ".cpcheck/*",
 ]
-NEAR_THRESHOLD = 0.8
+SCHEMA_VERSION = 2  # mudou o formato? o índice é recriado sozinho
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha TEXT NOT NULL, stamp TEXT);
 CREATE TABLE IF NOT EXISTS functions (
     id INTEGER PRIMARY KEY, path TEXT NOT NULL, qualname TEXT NOT NULL,
     lineno INTEGER, end_lineno INTEGER, n_tokens INTEGER,
-    h_exact TEXT, h_struct TEXT, formula TEXT, sig BLOB
+    h_exact TEXT, h_struct TEXT, sig BLOB
 );
+CREATE TABLE IF NOT EXISTS formulas (canon TEXT NOT NULL, fn_id INTEGER NOT NULL, lineno INTEGER);
+CREATE INDEX IF NOT EXISTS ix_formula ON formulas(canon);
+CREATE INDEX IF NOT EXISTS ix_formula_fn ON formulas(fn_id);
 CREATE INDEX IF NOT EXISTS ix_fn_path ON functions(path);
 CREATE INDEX IF NOT EXISTS ix_fn_exact ON functions(h_exact);
 CREATE INDEX IF NOT EXISTS ix_fn_struct ON functions(h_struct);
-CREATE INDEX IF NOT EXISTS ix_fn_formula ON functions(formula);
 CREATE TABLE IF NOT EXISTS bands (band TEXT NOT NULL, fn_id INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_band ON bands(band);
 CREATE INDEX IF NOT EXISTS ix_band_fn ON bands(fn_id);
@@ -61,12 +64,20 @@ def find_root(start: Path) -> Path:
 
 
 class Index:
-    def __init__(self, root: Path, min_tokens: int = 40) -> None:
+    def __init__(self, root: Path, config: Config | None = None) -> None:
         self.root = root.resolve()
-        self.min_tokens = min_tokens
+        self.config = config or Config.load(self.root)
+        self.min_tokens = self.config.min_tokens
         db_dir = self.root / ".cpcheck"
         db_dir.mkdir(exist_ok=True)
-        self.db = sqlite3.connect(db_dir / "index.db")
+        db_path = db_dir / "index.db"
+        self.db = sqlite3.connect(db_path)
+        if self.db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            self.db.close()
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{db_path}{suffix}").unlink(missing_ok=True)
+            self.db = sqlite3.connect(db_path)
+            self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
@@ -99,6 +110,7 @@ class Index:
 
     def _delete(self, rel: str) -> None:
         self.db.execute("DELETE FROM bands WHERE fn_id IN (SELECT id FROM functions WHERE path=?)", (rel,))
+        self.db.execute("DELETE FROM formulas WHERE fn_id IN (SELECT id FROM functions WHERE path=?)", (rel,))
         self.db.execute("DELETE FROM functions WHERE path=?", (rel,))
         self.db.execute("DELETE FROM files WHERE path=?", (rel,))
 
@@ -107,10 +119,13 @@ class Index:
         for f in funcs:
             sig = minhash.signature(f.tokens)
             cur = self.db.execute(
-                "INSERT INTO functions(path, qualname, lineno, end_lineno, n_tokens, h_exact, h_struct, formula, sig)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                (rel, f.qualname, f.lineno, f.end_lineno, f.n_tokens, f.h_exact, f.h_struct, f.formula,
-                 minhash.to_bytes(sig)),
+                "INSERT INTO functions(path, qualname, lineno, end_lineno, n_tokens, h_exact, h_struct, sig)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (rel, f.qualname, f.lineno, f.end_lineno, f.n_tokens, f.h_exact, f.h_struct, minhash.to_bytes(sig)),
+            )
+            self.db.executemany(
+                "INSERT INTO formulas(canon, fn_id, lineno) VALUES (?, ?, ?)",
+                [(c, cur.lastrowid, ln) for c, ln in f.formulas] if self.config.formulas_enabled(rel) else [],
             )
             self.db.executemany(
                 "INSERT INTO bands(band, fn_id) VALUES (?, ?)", [(b, cur.lastrowid) for b in minhash.bands(sig)]
@@ -118,7 +133,7 @@ class Index:
 
     def scan(self, exclude: list[str] | None = None) -> tuple[int, int]:
         """Atualiza o índice. Devolve (arquivos reprocessados, arquivos removidos)."""
-        exclude = DEFAULT_EXCLUDE + (exclude or [])
+        exclude = DEFAULT_EXCLUDE + self.config.exclude + (exclude or [])
         known = {p: (sha, stamp) for p, sha, stamp in self.db.execute("SELECT path, sha, stamp FROM files")}
         seen: set[str] = set()
         changed = 0
@@ -146,8 +161,15 @@ class Index:
         return changed, len(removed)
 
     # ---- leitura -----------------------------------------------------------
-    def query(self, f: FunctionInfo, limit: int = 3, near_threshold: float = NEAR_THRESHOLD) -> list[Match]:
-        """Procura duplicatas de ``f`` no índice, ignorando a própria função."""
+    def query(self, f: FunctionInfo, limit: int = 3) -> list[Match]:
+        """Procura duplicatas de ``f`` no índice, ignorando a própria função.
+
+        Funções em ``allow`` (duplicação intencional) não são cobradas, mas
+        continuam valendo como origem a reutilizar para quem está fora da regra.
+        """
+        if self.config.allowed(f.path, f.qualname):
+            return []
+        near_threshold = self.config.near_threshold
         own = (f.path, f.qualname)
         found: dict[tuple[str, str], Match] = {}
 
@@ -159,8 +181,10 @@ class Index:
 
         add("exact", 1.0, self.db.execute("SELECT path, qualname, lineno FROM functions WHERE h_exact=?", (f.h_exact,)))
         add("struct", 1.0, self.db.execute("SELECT path, qualname, lineno FROM functions WHERE h_struct=?", (f.h_struct,)))
-        if f.formula:
-            add("formula", 1.0, self.db.execute("SELECT path, qualname, lineno FROM functions WHERE formula=?", (f.formula,)))
+        for canon, _ in (f.formulas if self.config.formulas_enabled(f.path) else []):
+            add("formula", 1.0, self.db.execute(
+                "SELECT fn.path, fn.qualname, fo.lineno FROM formulas fo JOIN functions fn ON fn.id=fo.fn_id"
+                " WHERE fo.canon=?", (canon,)))
 
         if f.n_tokens >= self.min_tokens and len(found) < limit:
             sig = minhash.signature(f.tokens)

@@ -1,0 +1,19 @@
+# Copie para .cpcheck.toml na raiz do repositório.
+
+# Globs (relativos à raiz) que não entram no índice.
+exclude = ["pocs/*", "scripts/_backfill_*.py"]
+
+# Tamanho mínimo (em tokens normalizados) para uma função entrar no índice.
+# Fórmulas entram sempre, mesmo em funções pequenas.
+min_tokens = 40
+
+# Similaridade mínima (0 a 1) para o tipo "near".
+near_threshold = 0.8
+
+# Duplicações intencionais: "glob do caminho::glob do nome da função".
+# Não são cobradas por serem cópia, mas continuam aparecendo como origem
+# a reutilizar quando alguém cria uma cópia nova em outro lugar.
+allow = ["shared/extratos/templates_*/*.py::_parse_br_number"]
+
+# Onde não indexar fórmulas (testes repetem a conta do código testado).
+formula_exclude = ["tests/*", "*/tests/*", "test_*.py", "*/test_*.py", "*_test.py"]

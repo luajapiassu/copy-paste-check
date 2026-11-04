@@ -1,12 +1,23 @@
-"""Forma canônica de fórmulas matemáticas.
+"""Forma canônica de fórmulas matemáticas, inclusive no meio de código pandas/numpy.
 
-Pega funções cujo corpo é só atribuições + ``return <expressão aritmética>``,
-substitui as variáveis intermediárias, simplifica com sympy e devolve uma string
-canônica. Assim ``(a - b) / b`` e ``a / b - 1`` viram a mesma coisa.
+Para cada função:
+1. Atribuições simples (``x = <expr>``) entram num ambiente e são substituídas
+   nas expressões seguintes, então ``d = a - b; return d / b`` vira ``(a - b) / b``.
+2. Toda expressão aritmética "raiz" (um ``BinOp`` cujo pai não é aritmético) é
+   convertida para sympy, junto com o ``return`` final.
+3. A expressão é simplificada e os símbolos são renomeados de forma canônica, para
+   que nomes de variáveis e ordem de parâmetros não importem.
 
-Os argumentos são renomeados por posição (x0, x1…) e testamos as permutações
-(até 4 argumentos) para que a ordem dos parâmetros não importe.
-sympy é opcional: sem ele, a camada de fórmulas fica desligada.
+Equivalências tratadas: ``df["close"]`` = ``df.close``; ``x.pct_change()`` =
+``x / x.shift(1) - 1``; ``x.diff()`` = ``x - x.shift(1)``; ``np.log`` = ``math.log``
+= ``log``; ``log(a) - log(b)`` = ``log(a / b)``; ``x ** 0.5`` = ``sqrt(x)``.
+
+Filtro de ruído: cada operação, função conhecida ou constante "não trivial" (fora
+de 0, 1, -1, 2) soma 1 de peso. O ``return`` precisa de peso 2; expressões no meio
+do código precisam de 3. Assim ``i + 1`` não entra, mas ``close / close.shift() - 1``
+entra.
+
+sympy é opcional e só é importado quando aparece uma candidata (custa ~0,4 s).
 """
 
 from __future__ import annotations
@@ -14,8 +25,20 @@ from __future__ import annotations
 import ast
 import itertools
 
-sp = None  # carregado sob demanda: importar sympy custa ~0,4 s e o hook precisa ser rápido
+sp = None
 _SP_MISSING = False
+
+MIN_WEIGHT_RETURN = 2
+MIN_WEIGHT_INLINE = 3
+MAX_SYMBOLS = 6
+_TRIVIAL = {0, 1, -1, 2}
+_MATH = {"log": "log", "exp": "exp", "sqrt": "sqrt", "abs": "Abs", "fabs": "Abs", "sin": "sin", "cos": "cos"}
+# Métodos/funções de agregação que viram uma função simbólica opaca f(x).
+_OPAQUE = {
+    "sum", "mean", "std", "var", "median", "min", "max", "cumsum", "cumprod", "prod", "count",
+    "nansum", "nanmean", "nanstd", "maximum", "minimum", "where", "clip", "rolling", "expanding",
+    "ewm", "round", "floor", "ceil", "dot",
+}
 
 
 def _sympy():
@@ -30,118 +53,194 @@ def _sympy():
     return sp
 
 
-def _looks_like_formula(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """Filtro barato (só AST) antes de tocar no sympy."""
-    body = fn.body
-    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
-        body = body[1:]
-    if not body or len(body) > 8 or not isinstance(body[-1], ast.Return) or body[-1].value is None:
-        return False
-    if not all(isinstance(s, (ast.Assign, ast.AnnAssign)) for s in body[:-1]):
-        return False
-    return any(isinstance(n, ast.BinOp) for s in body for n in ast.walk(s))
-
-_FUNCS = {"log": "log", "exp": "exp", "sqrt": "sqrt", "abs": "Abs", "fabs": "Abs", "log1p": None, "power": None}
-_MIN_OPS = 2
-_MAX_PERM_ARGS = 4
-
-
 class _NotFormula(Exception):
     pass
 
 
-def _attr_name(node: ast.AST) -> str:
+def _ref_name(node: ast.AST) -> str:
+    """``df.close``, ``df["close"]`` e ``self.df.close`` viram nomes de símbolo estáveis."""
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
-        return f"{_attr_name(node.value)}_{node.attr}"
+        return f"{_ref_name(node.value)}.{node.attr}"
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+        return f"{_ref_name(node.value)}.{node.slice.value}"
     raise _NotFormula
 
 
-def _to_sympy(node: ast.AST, env: dict[str, object], ops: list[int]):
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-        return sp.nsimplify(node.value, rational=True)
-    if isinstance(node, ast.Name):
-        if node.id in env:
-            return env[node.id]
-        return sp.Symbol(node.id)
-    if isinstance(node, ast.Attribute):
-        return sp.Symbol(_attr_name(node))
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-        val = _to_sympy(node.operand, env, ops)
-        return -val if isinstance(node.op, ast.USub) else val
-    if isinstance(node, ast.BinOp):
-        left, right = _to_sympy(node.left, env, ops), _to_sympy(node.right, env, ops)
-        ops[0] += 1
-        match node.op:
-            case ast.Add():
-                return left + right
-            case ast.Sub():
-                return left - right
-            case ast.Mult():
-                return left * right
-            case ast.Div():
-                return left / right
-            case ast.Pow():
-                return left**right
+class _Converter:
+    def __init__(self, env: dict[str, tuple[object, int]]) -> None:
+        self.env = env
+        self.weight = 0
+
+    def __call__(self, node: ast.AST):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            if node.value not in _TRIVIAL:
+                self.weight += 1
+            return sp.nsimplify(node.value, rational=True)
+        if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)):
+            name = _ref_name(node)
+            if isinstance(node, ast.Name) and name in self.env:
+                expr, weight = self.env[name]  # variável intermediária: herda o peso da expressão
+                self.weight += weight
+                return expr
+            return sp.Symbol(name)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            val = self(node.operand)
+            return -val if isinstance(node.op, ast.USub) else val
+        if isinstance(node, ast.BinOp):
+            left, right = self(node.left), self(node.right)
+            self.weight += 1
+            match node.op:
+                case ast.Add():
+                    return left + right
+                case ast.Sub():
+                    return left - right
+                case ast.Mult():
+                    return left * right
+                case ast.Div():
+                    return left / right
+                case ast.Pow():
+                    return left**right
+            raise _NotFormula
+        if isinstance(node, ast.Call):
+            return self._call(node)
         raise _NotFormula
-    if isinstance(node, ast.Call) and not node.keywords:
-        fname = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
-        args = [_to_sympy(a, env, ops) for a in node.args]
-        ops[0] += 1
+
+    def _call(self, node: ast.Call):
+        func = node.func
+        fname = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if fname is None:
+            raise _NotFormula
+        # Método pandas: x.shift(n), x.pct_change(), x.diff(), x.mean()…
+        is_method = isinstance(func, ast.Attribute) and not (
+            isinstance(func.value, ast.Name) and func.value.id in ("np", "numpy", "math", "pd", "sp", "scipy")
+        )
+        args = [self(a) for a in node.args]
+        kw = {k.arg: k.value for k in node.keywords}
+        if is_method:
+            obj = self(func.value)
+            self.weight += 1
+            periods = args[0] if args else (self(kw["periods"]) if "periods" in kw else sp.Integer(1))
+            shift = sp.Function("shift")
+            if fname == "shift":
+                return shift(obj, periods)
+            if fname == "pct_change":
+                return obj / shift(obj, periods) - 1
+            if fname == "diff":
+                return obj - shift(obj, periods)
+            if fname in _MATH and not args:
+                return getattr(sp, _MATH[fname])(obj)
+            if fname in _OPAQUE:
+                return sp.Function(fname)(obj, *args)
+            raise _NotFormula
+        self.weight += 1
         if fname == "log1p" and len(args) == 1:
             return sp.log(1 + args[0])
         if fname in ("power", "pow") and len(args) == 2:
             return args[0] ** args[1]
-        target = _FUNCS.get(fname or "")
-        if target and len(args) == 1:
-            return getattr(sp, target)(args[0])
-    raise _NotFormula
-
-
-def _body_expr(fn: ast.FunctionDef | ast.AsyncFunctionDef, env: dict[str, object], ops: list[int]):
-    body = fn.body
-    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
-        body = body[1:]
-    if not body or len(body) > 8:
+        if fname in _MATH and len(args) == 1:
+            return getattr(sp, _MATH[fname])(args[0])
+        if fname in _OPAQUE and args:
+            return sp.Function(fname)(*args)
         raise _NotFormula
-    for stmt in body[:-1]:
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
-            env[stmt.targets[0].id] = _to_sympy(stmt.value, env, ops)
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
-            env[stmt.target.id] = _to_sympy(stmt.value, env, ops)
-        else:
-            raise _NotFormula
-    last = body[-1]
-    if not isinstance(last, ast.Return) or last.value is None:
-        raise _NotFormula
-    return _to_sympy(last.value, env, ops)
 
 
-def canonical_formula(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
-    if not _looks_like_formula(fn) or _sympy() is None:
-        return None
-    arg_names = [a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs if a.arg not in ("self", "cls")]
-    placeholders = [sp.Symbol(f"x{i}") for i in range(len(arg_names))]
-    ops = [0]
-    try:
-        expr = _body_expr(fn, dict(zip(arg_names, placeholders)), ops)
-    except (_NotFormula, TypeError, ValueError, ZeroDivisionError, RecursionError):
-        return None
-    if ops[0] < _MIN_OPS or not expr.free_symbols:
-        return None
+def _canonical(expr) -> str | None:
     try:
         expr = sp.cancel(sp.expand(sp.expand_log(expr, force=True)))
     except Exception:  # sympy pode falhar em casos exóticos; nunca travar
         return None
+    # Soma simples de variáveis/constantes (a + b + c) é genérica demais para ser "fórmula".
+    if expr.is_Add and all(t.is_Symbol or t.is_Number for t in expr.args):
+        return None
+    syms = sorted(expr.free_symbols, key=str)
+    if not syms or len(syms) > MAX_SYMBOLS:
+        return None
+    # Agrupa símbolos pelo "papel" que têm na expressão; só permuta dentro de empates.
+    def role(s):
+        return sp.srepr(expr.xreplace({o: (sp.Symbol("S") if o == s else sp.Symbol("T")) for o in syms}))
 
-    used = [s for s in placeholders if s in expr.free_symbols]
-    if len(used) > _MAX_PERM_ARGS:
-        return sp.srepr(expr)
+    groups: dict[str, list] = {}
+    for s in syms:
+        groups.setdefault(role(s), []).append(s)
+    ordered = [groups[k] for k in sorted(groups)]
     best: str | None = None
-    for perm in itertools.permutations(used):
-        renamed = expr.xreplace({old: sp.Symbol(f"p{i}") for i, old in enumerate(perm)})
-        text = sp.srepr(renamed)
+    for combo in itertools.islice(itertools.product(*(itertools.permutations(g) for g in ordered)), 120):
+        flat = [s for g in combo for s in g]
+        text = sp.srepr(expr.xreplace({old: sp.Symbol(f"p{i}") for i, old in enumerate(flat)}))
         if best is None or text < best:
             best = text
     return best
+
+
+def _roots(stmt: ast.stmt):
+    """Expressões aritméticas "raiz" dentro de um statement (sem descer em defs aninhadas)."""
+    arith = (ast.BinOp, ast.UnaryOp)
+    stack: list[tuple[ast.AST, bool]] = [(stmt, False)]
+    while stack:
+        node, parent_arith = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)) and node is not stmt:
+            continue
+        if isinstance(node, ast.BinOp) and not parent_arith:
+            yield node
+        is_arith = isinstance(node, arith)
+        for child in ast.iter_child_nodes(node):
+            stack.append((child, is_arith))
+
+
+def _has_candidate(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Filtro barato (só AST) para não importar o sympy à toa."""
+    for node in ast.walk(fn):
+        if isinstance(node, ast.BinOp) and (isinstance(node.left, ast.BinOp) or isinstance(node.right, ast.BinOp)
+                                            or isinstance(node.left, ast.Call) or isinstance(node.right, ast.Call)):
+            return True
+        if isinstance(node, ast.Return) and node.value is not None and any(
+                isinstance(n, ast.BinOp) for n in ast.walk(node.value)):
+            return True
+        if isinstance(node, ast.Call) and any(isinstance(arg, ast.BinOp) for arg in node.args):
+            return True
+    return False
+
+
+def function_formulas(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, int]]:
+    """Lista de (forma canônica, linha) das fórmulas da função, sem repetições."""
+    if not _has_candidate(fn) or _sympy() is None:
+        return []
+    arg_names = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+    env: dict[str, tuple[object, int]] = {}
+    out: dict[str, int] = {}
+
+    def add(node: ast.AST, min_weight: int) -> None:
+        conv = _Converter(env)
+        try:
+            expr = conv(node)
+        except (_NotFormula, TypeError, ValueError, ZeroDivisionError, RecursionError, AttributeError):
+            return
+        if conv.weight < min_weight:
+            return
+        canon = _canonical(expr)
+        if canon and canon not in out:
+            out[canon] = node.lineno
+
+    body = fn.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
+        body = body[1:]
+    for stmt in body:
+        if isinstance(stmt, ast.Return) and stmt.value is not None:
+            add(stmt.value, MIN_WEIGHT_RETURN)
+        else:
+            for root in _roots(stmt):
+                add(root, MIN_WEIGHT_INLINE)
+        # Atualiza o ambiente depois de olhar o statement (ordem de execução).
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            target = stmt.targets[0] if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 else getattr(stmt, "target", None)
+            if isinstance(target, ast.Name) and stmt.value is not None and target.id not in arg_names:
+                conv = _Converter(env)
+                try:
+                    env[target.id] = (conv(stmt.value), conv.weight)
+                except (_NotFormula, TypeError, ValueError, ZeroDivisionError, RecursionError, AttributeError):
+                    env.pop(target.id, None)
+            elif isinstance(target, ast.Name):
+                env.pop(target.id, None)
+    return list(out.items())

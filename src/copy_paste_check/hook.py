@@ -100,8 +100,9 @@ def check_change(event: str, tool: str, inp: dict, mode: str, limit: int = 3) ->
         grouped.setdefault(f.qualname, []).append(m)
     lines = []
     for qual, ms in list(grouped.items())[:limit]:
-        extra = f" (também: {', '.join(f'{m.path}:{m.lineno}' for m in ms[1:])})" if len(ms) > 1 else ""
-        lines.append(f"{qual} ~ {ms[0].short()}{extra}")
+        best = ms[0]
+        extra = f"; também em {', '.join(f'{m.path}:{m.lineno}' for m in ms[1:])}" if len(ms) > 1 else ""
+        lines.append(f"`{qual}` (nova) ≈ `{best.qualname}` em {best.path}:{best.lineno} [{best.kind}]{extra}")
     return level, lines
 
 
@@ -126,13 +127,13 @@ def run(stream=sys.stdin) -> int:
     body = "\n".join(f"- {line}" for line in lines)
     if level == "block":
         reason = (
-            f"cpcheck: função já existe no repo:\n{body}\n"
-            "Reutilize (import) a existente. Se for intencional, marque a def com `# cpcheck: ignore`."
+            f"cpcheck: já existe função equivalente no repo:\n{body}\n"
+            "Importe e use a existente em vez de recriar. Se a cópia for intencional, marque a def com `# cpcheck: ignore`."
         )
         out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                       "permissionDecisionReason": reason}}
     else:
-        ctx = f"cpcheck: possível duplicata (avalie reutilizar):\n{body}"
+        ctx = f"cpcheck: possível duplicata (avalie reutilizar a existente):\n{body}"
         out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": ctx}}
     print(json.dumps(out, ensure_ascii=False))
     return 0

@@ -8,9 +8,11 @@ Regra geral: **tudo que dá para provar com regra é determinístico; o LLM só 
 - [x] CLI `scan` / `check` / `diff` (com `--markdown` para PR)
 - [x] Hook do Claude Code (bloqueia em PreToolUse, avisa em PostToolUse) com resposta de poucas linhas
 - [x] Skill para agentes
-- [ ] Fórmulas dentro de qualquer expressão, não só no `return` (ex.: `df["ret"] = df.close / df.close.shift() - 1`)
-- [ ] Equivalências de pandas/numpy (`np.log` = `math.log`, `.pct_change()` = `x / x.shift() - 1`)
-- [ ] Configuração por repositório (`.cpcheck.toml`): exclusões, `min_tokens`, limiar `near`
+- [x] Fórmulas dentro de qualquer expressão, não só no `return` (ex.: `df["ret"] = df.close / df.close.shift() - 1`)
+- [x] Equivalências de pandas/numpy (`np.log` = `math.log`, `.pct_change()` = `x / x.shift() - 1`, `.diff()`, `df["x"]` = `df.x`)
+- [x] Configuração por repositório (`.cpcheck.toml`): exclusões, `min_tokens`, limiar `near`, duplicações intencionais (`allow`)
+- [x] Hook validado em sessão real do Claude Code
+- [ ] Fórmulas fora de funções (scripts e notebooks)
 - [ ] GitHub Action pronta, que comenta o resultado do `cpcheck diff --markdown` no PR
 - [ ] Índice compartilhado entre repositórios (Postgres), para achar duplicatas entre projetos
 

@@ -13,7 +13,7 @@ import ast
 import hashlib
 from dataclasses import dataclass, field
 
-from .formula import canonical_formula
+from .formula import function_formulas
 
 
 @dataclass(slots=True)
@@ -26,7 +26,7 @@ class FunctionInfo:
     h_exact: str
     h_struct: str
     tokens: list[str] = field(repr=False)
-    formula: str | None = None
+    formulas: list[tuple[str, int]] = field(default_factory=list)  # (forma canônica, linha)
 
 
 def _strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
@@ -132,7 +132,7 @@ def fingerprint(fn: ast.FunctionDef | ast.AsyncFunctionDef, path: str, qualname:
         h_exact=_digest(" ".join(exact)),
         h_struct=_digest(" ".join(struct)),
         tokens=toks,
-        formula=canonical_formula(fn),
+        formulas=function_formulas(fn),
     )
 
 
@@ -154,7 +154,7 @@ def extract_functions(source: str, path: str, min_tokens: int = 40) -> list[Func
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qual = f"{prefix}{child.name}"
                 info = fingerprint(child, path, qual)
-                if info.n_tokens >= min_tokens or info.formula:
+                if info.n_tokens >= min_tokens or info.formulas:
                     found.append(info)
                 visit(child, qual + ".")
             elif isinstance(child, ast.ClassDef):

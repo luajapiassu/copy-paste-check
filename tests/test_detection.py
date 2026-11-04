@@ -8,6 +8,7 @@ import pytest
 
 from copy_paste_check import hook
 from copy_paste_check.cli import main
+from copy_paste_check.config import Config
 from copy_paste_check.extract import extract_functions
 from copy_paste_check.index import Index
 
@@ -62,32 +63,58 @@ def test_struct_keeps_called_functions():
     assert a.h_struct != b.h_struct
 
 
+def canon(src: str, name: str = "r") -> set[str]:
+    return {c for c, _ in fn(src, name).formulas}
+
+
 @pytest.mark.parametrize("other", [
     "def r(a, b):\n    return a / b - 1\n",
     "def r(b, a):\n    return (a - b) / b\n".replace("(a - b) / b", "(b - a) / a"),
     "def r(final, inicial):\n    diff = final - inicial\n    return diff / inicial\n",
 ])
 def test_formula_equivalent_forms(other):
-    base = fn("def r(a, b):\n    return (a - b) / b\n", "r")
-    assert base.formula is not None
-    assert fn(other, "r").formula == base.formula
+    base = canon("def r(a, b):\n    return (a - b) / b\n")
+    assert base
+    assert canon(other) == base
 
 
 def test_formula_log_identity():
-    a = fn("import math\ndef r(a, b):\n    return math.log(a) - math.log(b)\n", "r")
-    b = fn("import numpy as np\ndef r(a, b):\n    return np.log(a / b)\n", "r")
-    assert a.formula == b.formula
+    a = canon("import math\ndef r(a, b):\n    return math.log(a) - math.log(b)\n")
+    assert a and a == canon("import numpy as np\ndef r(a, b):\n    return np.log(a / b)\n")
 
 
 def test_formula_different_math_differs():
-    a = fn("def r(a, b):\n    return (a - b) / b\n", "r")
-    b = fn("def r(a, b):\n    return (a - b) / a + 1\n", "r")
-    assert a.formula != b.formula
+    assert canon("def r(a, b):\n    return (a - b) / b\n") != canon("def r(a, b):\n    return (a - b) / a + 1\n")
 
 
 def test_not_a_formula():
-    assert fn("def r(a):\n    print(a)\n    return a * 2 + 1\n", "r").formula is None
-    assert fn("def r(a):\n    return a\n", "r").formula is None
+    assert canon("def r(a):\n    return a\n") == set()
+    assert canon("def r(xs):\n    for i in range(len(xs)):\n        print(xs[i + 1])\n    return 0\n") == set()
+
+
+def test_formula_pandas_equivalences():
+    a = canon("def r(df):\n    df['ret'] = df['close'] / df['close'].shift(1) - 1\n    return df\n")
+    b = canon("def r(precos):\n    out = precos.close.pct_change()\n    return out.mean() * 252\n")
+    c = canon("def r(p):\n    x = p.close\n    return (x - x.shift()) / x.shift()\n")
+    assert a and a <= b | c and a == c
+
+
+def test_formula_inline_inside_loop():
+    src = (
+        "def r(rows):\n"
+        "    out = []\n"
+        "    for row in rows:\n"
+        "        out.append((row.final - row.inicial) / row.inicial * 100)\n"
+        "    return out\n"
+    )
+    other = "def s(a, b):\n    return (a / b - 1) * 100\n"
+    assert canon(src) & canon(other, "s")
+
+
+def test_formula_constants_matter():
+    anual_252 = canon("def r(d):\n    return (1 + d) ** 252 - 1\n")
+    anual_365 = canon("def r(d):\n    return (1 + d) ** 365 - 1\n")
+    assert anual_252 and anual_252 != anual_365
 
 
 def test_syntax_error_returns_empty():
@@ -198,3 +225,27 @@ def test_cli_diff(repo: Path, capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert "wavg" in out and "media_ponderada" in out
+
+
+def test_config_allow_intentional_copies(repo: Path):
+    (repo / ".cpcheck.toml").write_text('allow = ["templates/*.py::_parse"]\n')
+    tpl = repo / "templates"
+    tpl.mkdir()
+    body = ORIGINAL.lstrip().split("\n\n\n")[0]
+    (tpl / "a.py").write_text(body.replace("media_ponderada", "_parse"))
+    idx = Index(repo)
+    assert idx.config.allowed("templates/b.py", "_parse")
+    idx.scan()
+    in_template = fn(body.replace("media_ponderada", "_parse"), "_parse")
+    in_template.path = "templates/b.py"
+    assert idx.query(in_template) == []  # cópia intencional: não cobra
+    outside = fn(body.replace("media_ponderada", "outra"), "outra")
+    outside.path = "shared/novo.py"
+    assert {m.path for m in idx.query(outside)} >= {"templates/a.py"}  # mas segue como origem a reutilizar
+    idx.close()
+
+
+def test_config_from_pyproject(tmp_path: Path):
+    (tmp_path / "pyproject.toml").write_text("[tool.cpcheck]\nmin_tokens = 10\nexclude = ['pocs/*']\n")
+    cfg = Config.load(tmp_path)
+    assert cfg.min_tokens == 10 and cfg.exclude == ["pocs/*"]

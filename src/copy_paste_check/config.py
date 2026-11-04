@@ -1,0 +1,57 @@
+"""Configuração por repositório: ``.cpcheck.toml`` ou ``[tool.cpcheck]`` no ``pyproject.toml``.
+
+Exemplo::
+
+    exclude = ["pocs/*", "scripts/_backfill_*.py"]
+    min_tokens = 40
+    near_threshold = 0.8
+    # Duplicações intencionais: "glob do caminho::glob do nome da função".
+    # Essas funções não são cobradas por serem cópia, mas continuam aparecendo
+    # como origem a reutilizar quando alguém cria uma cópia nova em outro lugar.
+    allow = ["shared/extratos/templates_*/*.py::_parse_br_number"]
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass(slots=True)
+class Config:
+    exclude: list[str] = field(default_factory=list)
+    min_tokens: int = 40
+    near_threshold: float = 0.8
+    allow: list[str] = field(default_factory=list)
+    # Em testes é normal repetir a conta do código testado; não indexa fórmulas ali.
+    formula_exclude: list[str] = field(
+        default_factory=lambda: ["tests/*", "*/tests/*", "test_*.py", "*/test_*.py", "*_test.py"]
+    )
+
+    def formulas_enabled(self, path: str) -> bool:
+        return not any(fnmatch.fnmatch(path, pat) for pat in self.formula_exclude)
+
+    def allowed(self, path: str, qualname: str) -> bool:
+        for rule in self.allow:
+            path_glob, _, name_glob = rule.partition("::")
+            if fnmatch.fnmatch(path, path_glob) and fnmatch.fnmatch(qualname, name_glob or "*"):
+                return True
+        return False
+
+    @classmethod
+    def load(cls, root: Path) -> Config:
+        data: dict = {}
+        own = root / ".cpcheck.toml"
+        if own.exists():
+            data = tomllib.loads(own.read_text(encoding="utf-8"))
+            data = data.get("cpcheck", data)
+        elif (root / "pyproject.toml").exists():
+            try:
+                data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+                data = data.get("tool", {}).get("cpcheck", {})
+            except tomllib.TOMLDecodeError:
+                data = {}
+        known = {k: data[k] for k in ("exclude", "min_tokens", "near_threshold", "allow", "formula_exclude") if k in data}
+        return cls(**known)
