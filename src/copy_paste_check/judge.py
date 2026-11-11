@@ -11,6 +11,7 @@ mudou o código de qualquer lado, a chave muda e o par é julgado de novo.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -44,10 +45,16 @@ ASK_SYSTEM = (
 Runner = Callable[[str, str, str | None, Path | None], str]  # (prompt, system, tools|None, cwd) -> texto
 
 
+USAGE: list[dict] = []  # uma entrada por chamada: tokens, custo e tempo (para medir modelo x custo)
+
+
 def run_claude(prompt: str, system: str, tools: str | None, cwd: Path | None) -> str:
     """Chama o CLI do Claude Code em modo print. ``tools=None``: sem ferramentas (julgamento puro)."""
-    cmd = ["claude", "-p", "--model", MODEL, "--no-session-persistence", "--system-prompt", system,
-           "--tools", tools or ""]
+    # Os três flags de isolamento cortam ~107k tokens de entrada por chamada (MCPs e settings do usuário
+    # eram carregados mesmo com --tools ""): "oi" passou de 107k para ~900 tokens.
+    cmd = ["claude", "-p", "--model", os.environ.get("CPCHECK_MODEL", MODEL), "--output-format", "json",
+           "--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands",
+           "--setting-sources", "", "--system-prompt", system, "--tools", tools or ""]
     if tools:
         cmd += ["--allowed-tools", tools]
     # sem ferramentas o cwd não importa: roda num diretório vazio para não carregar o CLAUDE.md do projeto
@@ -56,7 +63,13 @@ def run_claude(prompt: str, system: str, tools: str | None, cwd: Path | None) ->
                              cwd=cwd if tools else empty, encoding="utf-8")
     if out.returncode != 0:
         raise RuntimeError(out.stderr.strip() or f"claude saiu com {out.returncode}")
-    return out.stdout
+    data = json.loads(out.stdout)
+    u = data.get("usage", {})
+    USAGE.append({"model": next(iter(data.get("modelUsage", {})), "?"), "input": u.get("input_tokens", 0),
+                  "cache_write": u.get("cache_creation_input_tokens", 0), "cache_read": u.get("cache_read_input_tokens", 0),
+                  "output": u.get("output_tokens", 0), "usd": data.get("total_cost_usd", 0.0),
+                  "ms": data.get("duration_ms", 0)})
+    return data.get("result", "")
 
 
 @dataclass(slots=True)
