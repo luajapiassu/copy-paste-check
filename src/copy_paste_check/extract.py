@@ -75,8 +75,9 @@ def _serialize(fn: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]) -> t
         exact.append(kind)
         if isinstance(node, ast.Name):
             exact.append(node.id)
-            toks.append(name(node.id))
-            struct.append(toks[-1])
+            struct.append(name(node.id))
+            # sem numerar: um parâmetro a mais não pode renomear todos os locais seguintes (v1→v2…)
+            toks.append("v" if node.id in local else node.id)
         elif isinstance(node, ast.arg):
             exact.append(node.arg)
             struct.append(name(node.arg))
