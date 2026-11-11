@@ -121,7 +121,7 @@ def _digest(text: str) -> str:
     return hashlib.blake2b(text.encode(), digest_size=12).hexdigest()
 
 
-def fingerprint(fn: ast.FunctionDef | ast.AsyncFunctionDef, path: str, qualname: str) -> FunctionInfo:
+def fingerprint(fn: ast.FunctionDef | ast.AsyncFunctionDef, path: str, qualname: str, formulas: bool = True) -> FunctionInfo:
     exact, struct, toks = _serialize(fn, _local_names(fn))
     return FunctionInfo(
         path=path,
@@ -132,11 +132,11 @@ def fingerprint(fn: ast.FunctionDef | ast.AsyncFunctionDef, path: str, qualname:
         h_exact=_digest(" ".join(exact)),
         h_struct=_digest(" ".join(struct)),
         tokens=toks,
-        formulas=function_formulas(fn),
+        formulas=function_formulas(fn) if formulas else [],
     )
 
 
-def extract_functions(source: str, path: str, min_tokens: int = 40) -> list[FunctionInfo]:
+def extract_functions(source: str, path: str, min_tokens: int = 40, formulas: bool = True) -> list[FunctionInfo]:
     """Devolve as funções do código que têm pelo menos ``min_tokens`` tokens.
 
     Fórmulas são mantidas mesmo abaixo do mínimo, porque costumam ser curtas.
@@ -153,7 +153,7 @@ def extract_functions(source: str, path: str, min_tokens: int = 40) -> list[Func
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qual = f"{prefix}{child.name}"
-                info = fingerprint(child, path, qual)
+                info = fingerprint(child, path, qual, formulas)
                 if info.n_tokens >= min_tokens or info.formulas:
                     found.append(info)
                 visit(child, qual + ".")

@@ -133,6 +133,7 @@ def test_index_incremental(repo: Path):
 
 
 def test_query_near_clone(repo: Path):
+    (repo / ".cpcheck.toml").write_text("near = true\n")
     idx = Index(repo)
     idx.scan()
     near = textwrap.dedent('''
@@ -197,6 +198,7 @@ def test_hook_ignore_marker(repo: Path):
 
 
 def test_hook_warns_formula_post(repo: Path):
+    (repo / ".cpcheck.toml").write_text("formula = true\n")
     new = repo / "novo.py"
     new.write_text("def variacao(a, b):\n    return a / b - 1\n")
     out = run_hook({"hook_event_name": "PostToolUse", "tool_name": "Write",
@@ -249,3 +251,13 @@ def test_config_from_pyproject(tmp_path: Path):
     (tmp_path / "pyproject.toml").write_text("[tool.cpcheck]\nmin_tokens = 10\nexclude = ['pocs/*']\n")
     cfg = Config.load(tmp_path)
     assert cfg.min_tokens == 10 and cfg.exclude == ["pocs/*"]
+
+
+def test_formula_and_near_off_by_default(repo: Path):
+    """Padrão leve: só exact/struct; sem sympy e sem MinHash no índice."""
+    idx = Index(repo)
+    idx.scan()
+    assert not idx.config.formula and not idx.config.near
+    assert idx.db.execute("SELECT count(*) FROM formulas").fetchone()[0] == 0
+    assert idx.db.execute("SELECT count(*) FROM bands").fetchone()[0] == 0
+    idx.close()

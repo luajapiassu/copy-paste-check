@@ -72,12 +72,14 @@ class Index:
         db_dir.mkdir(exist_ok=True)
         db_path = db_dir / "index.db"
         self.db = sqlite3.connect(db_path)
-        if self.db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+        # trocar formula/near na config também recria o índice (ele guarda só o que está ligado)
+        version = SCHEMA_VERSION * 10 + self.config.formula + 2 * self.config.near
+        if self.db.execute("PRAGMA user_version").fetchone()[0] != version:
             self.db.close()
             for suffix in ("", "-wal", "-shm"):
                 Path(f"{db_path}{suffix}").unlink(missing_ok=True)
             self.db = sqlite3.connect(db_path)
-            self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self.db.execute(f"PRAGMA user_version={version}")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
@@ -117,19 +119,21 @@ class Index:
     def _insert(self, rel: str, sha: str, stamp: str, funcs: list[FunctionInfo]) -> None:
         self.db.execute("INSERT OR REPLACE INTO files(path, sha, stamp) VALUES (?, ?, ?)", (rel, sha, stamp))
         for f in funcs:
-            sig = minhash.signature(f.tokens)
+            sig = minhash.signature(f.tokens) if self.config.near else None
             cur = self.db.execute(
                 "INSERT INTO functions(path, qualname, lineno, end_lineno, n_tokens, h_exact, h_struct, sig)"
                 " VALUES (?,?,?,?,?,?,?,?)",
-                (rel, f.qualname, f.lineno, f.end_lineno, f.n_tokens, f.h_exact, f.h_struct, minhash.to_bytes(sig)),
+                (rel, f.qualname, f.lineno, f.end_lineno, f.n_tokens, f.h_exact, f.h_struct,
+                 minhash.to_bytes(sig) if sig else None),
             )
             self.db.executemany(
                 "INSERT INTO formulas(canon, fn_id, lineno) VALUES (?, ?, ?)",
                 [(c, cur.lastrowid, ln) for c, ln in f.formulas] if self.config.formulas_enabled(rel) else [],
             )
-            self.db.executemany(
-                "INSERT INTO bands(band, fn_id) VALUES (?, ?)", [(b, cur.lastrowid) for b in minhash.bands(sig)]
-            )
+            if sig:
+                self.db.executemany(
+                    "INSERT INTO bands(band, fn_id) VALUES (?, ?)", [(b, cur.lastrowid) for b in minhash.bands(sig)]
+                )
 
     def scan(self, exclude: list[str] | None = None) -> tuple[int, int]:
         """Atualiza o índice. Devolve (arquivos reprocessados, arquivos removidos)."""
@@ -152,7 +156,7 @@ class Index:
                 continue
             self._delete(rel)
             source = data.decode("utf-8", errors="replace")
-            self._insert(rel, sha, stamp, extract_functions(source, rel, self.min_tokens))
+            self._insert(rel, sha, stamp, extract_functions(source, rel, self.min_tokens, self.config.formula))
             changed += 1
         removed = [p for p in known if p not in seen]
         for rel in removed:
@@ -181,12 +185,12 @@ class Index:
 
         add("exact", 1.0, self.db.execute("SELECT path, qualname, lineno FROM functions WHERE h_exact=?", (f.h_exact,)))
         add("struct", 1.0, self.db.execute("SELECT path, qualname, lineno FROM functions WHERE h_struct=?", (f.h_struct,)))
-        for canon, _ in (f.formulas if self.config.formulas_enabled(f.path) else []):
+        for canon, _ in (f.formulas if self.config.formula and self.config.formulas_enabled(f.path) else []):
             add("formula", 1.0, self.db.execute(
                 "SELECT fn.path, fn.qualname, fo.lineno FROM formulas fo JOIN functions fn ON fn.id=fo.fn_id"
                 " WHERE fo.canon=?", (canon,)))
 
-        if f.n_tokens >= self.min_tokens and len(found) < limit:
+        if self.config.near and f.n_tokens >= self.min_tokens and len(found) < limit:
             sig = minhash.signature(f.tokens)
             band_list = minhash.bands(sig)
             marks = ",".join("?" * len(band_list))
