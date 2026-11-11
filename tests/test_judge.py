@@ -59,7 +59,7 @@ def test_memory_key_changes_when_code_changes(tmp_path):
 def test_strong_matches_skip_model_and_failures_are_uncertain(tmp_path):
     idx, results = _setup(tmp_path)
     path, qual, line, _ = results[0]
-    strong = [(path, qual, line, [Match("struct", 1.0, "a.py", "vol", 2), Match("near", 0.9, "a.py", "vol", 2)])]
+    strong = [(path, qual, line, [Match("struct", 1.0, "a.py", "vol", 2), Match("near", 0.97, "a.py", "vol", 2)])]
     v = judge.judge(idx, strong, runner=lambda *a: 1 / 0)
     assert [x.origem for x in v] == ["regra", "regra"] and {x.veredito for x in v} == {"duplicata"}
 

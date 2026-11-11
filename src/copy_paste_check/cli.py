@@ -133,7 +133,7 @@ def cmd_judge(a) -> int:
     idx.close()
     for v in verdicts:
         print(f"{v.path}:{v.lineno} {v.qualname} ~ {v.other.path}:{v.other.lineno} {v.other.qualname}"
-              f" [{v.veredito}/{v.origem}] -> {v.canonica} | {v.diferencas}")
+              f" {v.other.kind}={v.other.score:.2f} [{v.veredito}/{v.origem}] -> {v.canonica} | {v.diferencas}")
     return 1 if a.fail_on == "strong" and any(v.veredito == "duplicata" for v in verdicts) else 0
 
 
@@ -169,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     j.add_argument("--base", default="origin/main")
     j.add_argument("--limit", type=int, default=3)
     j.add_argument("--low", type=float, default=0.70)
-    j.add_argument("--high", type=float, default=0.85)
+    j.add_argument("--high", type=float, default=0.95)
     j.add_argument("--no-remember", action="store_true", help="não grava em cpcheck-verdicts.json")
     j.add_argument("--fail-on", choices=["strong", "none"], default="none")
     j.set_defaults(fn=cmd_judge)
@@ -181,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
     h = sub.add_parser("hook", help="hook do Claude Code (lê JSON do stdin)")
     h.set_defaults(fn=lambda a: hook.run())
 
+    for stream in (sys.stdout, sys.stderr):  # Windows cp1252 não imprime setas nem acentos do modelo
+        stream.reconfigure(encoding="utf-8", errors="replace")
     a = p.parse_args(argv)
     return a.fn(a)
 

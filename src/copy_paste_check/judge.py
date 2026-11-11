@@ -105,7 +105,7 @@ def parse_verdict(text: str) -> dict:
 
 
 def judge(idx: Index, results: list[tuple[str, str, int, list[Match]]], runner: Runner = run_claude,
-          low: float = 0.70, high: float = 0.85, remember: bool = True) -> list[Verdict]:
+          low: float = 0.70, high: float = 0.95, remember: bool = True) -> list[Verdict]:
     """``results`` vem de ``check``/``diff``: (path, função, linha, matches)."""
     mem = load_memory(idx.root)
     out: list[Verdict] = []
