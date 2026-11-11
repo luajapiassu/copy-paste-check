@@ -27,3 +27,8 @@ Só use `# cpcheck: ignore` na `def` quando a duplicação for **intencional** (
 ## Revisão de PR
 
 Rode `cpcheck diff --base origin/main --markdown` e inclua a saída na revisão. Para cada item, diga em uma linha se é para reutilizar, generalizar ou se é intencional.
+
+## Passo Haiku (só leitura)
+
+- Antes de escrever: `cpcheck ask "lista de dias úteis entre datas" "tirar acento"` devolve, por item, a função canônica e as ressalvas que mudam o resultado.
+- No PR ou depois do hook: `cpcheck judge` (sem arquivos = o diff contra `--base`). Exact/struct e near ≥ 0,95 são duplicata sem chamar modelo; o resto o Haiku julga e o veredito fica em `cpcheck-verdicts.json` (versionado). `coincidencia` e `intencional` não exigem ação; `duplicata` segue a tabela acima; `incerto` = Haiku indisponível, olhe a função apontada.
