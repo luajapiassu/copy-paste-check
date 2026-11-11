@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import hook
+from . import judge as judge_mod
 from .extract import extract_functions
 from .index import Index, find_root
 
@@ -97,6 +98,50 @@ def cmd_diff(a) -> int:
     return _report(results, a.json, a.fail_on)
 
 
+def _candidates(idx: Index, a) -> list:
+    """Funções a julgar: as dos arquivos pedidos ou, sem arquivos, as novas/alteradas vs --base."""
+    results = []
+    if a.files:
+        files = [idx.rel(f) for f in a.files]
+    else:
+        files = [p for p in _git(idx.root, "diff", "--name-only", "--diff-filter=AMR", f"{a.base}...HEAD").split()
+                 if p.endswith(".py")]
+    for rel in files:
+        path = idx.root / rel
+        if not path.exists():
+            continue
+        after = path.read_text(encoding="utf-8", errors="replace")
+        if a.files:
+            funcs = extract_functions(after, rel, idx.min_tokens, idx.config.formula)
+        else:
+            try:
+                before = _git(idx.root, "show", f"{a.base}:{rel}")
+            except subprocess.CalledProcessError:
+                before = ""
+            funcs = hook.new_or_changed(before, after, rel, idx.min_tokens)
+        for f in funcs:
+            ms = idx.query(f, limit=a.limit)
+            if ms:
+                results.append((rel, f.qualname, f.lineno, ms))
+    return results
+
+
+def cmd_judge(a) -> int:
+    idx = _open(a.root)
+    idx.scan()
+    verdicts = judge_mod.judge(idx, _candidates(idx, a), low=a.low, high=a.high, remember=not a.no_remember)
+    idx.close()
+    for v in verdicts:
+        print(f"{v.path}:{v.lineno} {v.qualname} ~ {v.other.path}:{v.other.lineno} {v.other.qualname}"
+              f" [{v.veredito}/{v.origem}] -> {v.canonica} | {v.diferencas}")
+    return 1 if a.fail_on == "strong" and any(v.veredito == "duplicata" for v in verdicts) else 0
+
+
+def cmd_ask(a) -> int:
+    print(judge_mod.ask(Path(a.root) if a.root else find_root(Path.cwd()), a.items))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="cpcheck", description="Detecta funções e fórmulas duplicadas.")
     p.add_argument("--root", help="raiz do repositório (padrão: procura .git a partir do cwd)")
@@ -118,6 +163,20 @@ def main(argv: list[str] | None = None) -> int:
         c.add_argument("--limit", type=int, default=3)
         c.add_argument("--fail-on", choices=["strong", "any", "none"], default="strong")
         c.set_defaults(fn=fn)
+
+    j = sub.add_parser("judge", help="Haiku julga os candidatos ambíguos (near 0,70-0,85, formula); sem arquivos: o diff vs --base")
+    j.add_argument("files", nargs="*")
+    j.add_argument("--base", default="origin/main")
+    j.add_argument("--limit", type=int, default=3)
+    j.add_argument("--low", type=float, default=0.70)
+    j.add_argument("--high", type=float, default=0.85)
+    j.add_argument("--no-remember", action="store_true", help="não grava em cpcheck-verdicts.json")
+    j.add_argument("--fail-on", choices=["strong", "none"], default="none")
+    j.set_defaults(fn=cmd_judge)
+
+    k = sub.add_parser("ask", help="busca prévia em linguagem natural (Haiku, só leitura)")
+    k.add_argument("items", nargs="+", help="o que você vai precisar, ex.: 'lista de dias úteis entre datas'")
+    k.set_defaults(fn=cmd_ask)
 
     h = sub.add_parser("hook", help="hook do Claude Code (lê JSON do stdin)")
     h.set_defaults(fn=lambda a: hook.run())
