@@ -4,6 +4,8 @@ Exemplo::
 
     exclude = ["pocs/*", "scripts/_backfill_*.py"]
     min_tokens = 40
+    formula = false   # true liga a camada de fórmulas (sympy)
+    near = false      # true liga o MinHash (cópias aproximadas)
     near_threshold = 0.8
     # Duplicações intencionais: "glob do caminho::glob do nome da função".
     # Essas funções não são cobradas por serem cópia, mas continuam aparecendo
@@ -23,6 +25,9 @@ from pathlib import Path
 class Config:
     exclude: list[str] = field(default_factory=list)
     min_tokens: int = 40
+    # Camadas caras, desligadas por padrão: exact/struct são sempre ligadas.
+    formula: bool = False  # exige sympy (pip install ".[formula]")
+    near: bool = False
     near_threshold: float = 0.8
     allow: list[str] = field(default_factory=list)
     # Em testes é normal repetir a conta do código testado; não indexa fórmulas ali.
@@ -53,5 +58,5 @@ class Config:
                 data = data.get("tool", {}).get("cpcheck", {})
             except tomllib.TOMLDecodeError:
                 data = {}
-        known = {k: data[k] for k in ("exclude", "min_tokens", "near_threshold", "allow", "formula_exclude") if k in data}
+        known = {k: data[k] for k in ("exclude", "min_tokens", "formula", "near", "near_threshold", "allow", "formula_exclude") if k in data}
         return cls(**known)

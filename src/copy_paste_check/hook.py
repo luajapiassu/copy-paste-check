@@ -56,11 +56,11 @@ def _ignored(source_lines: list[str], f: FunctionInfo) -> bool:
     return False
 
 
-def new_or_changed(before: str, after: str, rel: str, min_tokens: int) -> list[FunctionInfo]:
-    old = {(f.qualname, f.h_struct) for f in extract_functions(before, rel, min_tokens)}
+def new_or_changed(before: str, after: str, rel: str, min_tokens: int, formulas: bool = True) -> list[FunctionInfo]:
+    old = {(f.qualname, f.h_struct) for f in extract_functions(before, rel, min_tokens, formulas)}
     lines = after.splitlines()
     return [
-        f for f in extract_functions(after, rel, min_tokens)
+        f for f in extract_functions(after, rel, min_tokens, formulas)
         if (f.qualname, f.h_struct) not in old and not _ignored(lines, f)
     ]
 
@@ -79,7 +79,7 @@ def check_change(event: str, tool: str, inp: dict, mode: str, limit: int = 3) ->
     try:
         idx.scan()
         rel = idx.rel(path)
-        funcs = new_or_changed(pair[0], pair[1], rel, idx.min_tokens)
+        funcs = new_or_changed(pair[0], pair[1], rel, idx.min_tokens, idx.config.formula)
         hits: list[tuple[FunctionInfo, Match]] = []
         for f in funcs:
             hits.extend((f, m) for m in idx.query(f, limit=limit) if m.path != rel or m.qualname != f.qualname)

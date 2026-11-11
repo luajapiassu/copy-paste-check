@@ -1,52 +1,30 @@
 # Roadmap
 
-Regra geral: **tudo que dá para provar com regra é determinístico; o LLM só interpreta evidência já calculada** e nunca decide sozinho.
+Regra geral: **tudo que dá para provar com regra é determinístico; o LLM só interpreta evidência já calculada** e nunca decide sozinho. Manter simples: pouca dependência, hook rápido, pouco CPU.
 
-## 1. Código (feito)
+## Feito
 
-- [x] Índice incremental em SQLite com os tipos `exact`, `struct`, `formula` e `near`
-- [x] CLI `scan` / `check` / `diff` (com `--markdown` para PR)
-- [x] Hook do Claude Code (bloqueia em PreToolUse, avisa em PostToolUse) com resposta de poucas linhas
+- [x] Índice incremental em SQLite com `exact` e `struct` (sempre ligados)
+- [x] `formula` (sympy) e `near` (MinHash) **opcionais**, desligados por padrão (`formula = true` / `near = true` no `.cpcheck.toml`)
+- [x] CLI `scan` / `check` / `diff` (com `--markdown`)
+- [x] Hook do Claude Code: bloqueia `exact`/`struct` (PreToolUse), avisa `formula`/`near` (PostToolUse)
 - [x] Skill para agentes
-- [x] Fórmulas dentro de qualquer expressão, não só no `return` (ex.: `df["ret"] = df.close / df.close.shift() - 1`)
-- [x] Equivalências de pandas/numpy (`np.log` = `math.log`, `.pct_change()` = `x / x.shift() - 1`, `.diff()`, `df["x"]` = `df.x`)
-- [x] Configuração por repositório (`.cpcheck.toml`): exclusões, `min_tokens`, limiar `near`, duplicações intencionais (`allow`)
-- [x] Hook validado em sessão real do Claude Code
-- [ ] Fórmulas fora de funções (scripts e notebooks)
-- [ ] GitHub Action pronta, que comenta o resultado do `cpcheck diff --markdown` no PR
-- [ ] Índice compartilhado entre repositórios (Postgres), para achar duplicatas entre projetos
+- [x] Configuração por repositório (`.cpcheck.toml`)
 
-## 2. Banco de dados: duplicidade de dados e reaproveitamento por PK/FK
+## Próximo
 
-Objetivo: quando o agente criar ou alterar uma tabela (model SQLAlchemy, migration Alembic, `CREATE TABLE`, `to_sql`), verificar se aqueles dados já existem e sugerir reaproveitamento via FK em vez de duplicar.
+- [ ] Etapa de PR: `cpcheck diff` no pre-push / pr-review. Sobra de `exact`/`struct` é reportada direto (a prova é o hash).
+- [ ] Subagent Haiku (somente leitura) só nos candidatos `near`/`formula`: recebe o par de funções + métricas e responde uma linha ("duplicata real, reusar X" / "coincidência" / "intencional").
 
-### Determinístico
+## Pontas soltas
 
-**Estático**, sem conectar no banco: roda no hook, em milissegundos.
+- [ ] Rodar no corpus do wright-apps e listar as duplicatas `exact`/`struct` existentes (medir ruído e acerto reais)
+- [ ] Construir o passo Haiku (candidatos `near`/`formula`) e a integração no pr-review
+- [ ] Testar o `diff` contra `origin/main` num repo de teste com commits
+- [ ] TS/TSX: hoje só Python (no wright-apps o `apps/web` fica de fora)
+- [ ] Decidir distribuição: biblioteca (pip por URL git) vs plugin do Claude Code; repo público ou privado
+- [ ] Decidir adoção em outro repo: hook no `settings.json`, passo no pre-push, ADR
 
-| Verificação | Como |
-|---|---|
-| Tabela nova parecida com uma existente | compara colunas normalizadas (`snake_case`, sem prefixos como `tb_`, `cod_`, `id_`) e tipos, a partir dos models e das migrations |
-| FK faltando | coluna com o mesmo nome e tipo da PK de outra tabela, mas sem `ForeignKey` |
-| Coluna repetida | a mesma coluna "de negócio" (ex.: `cnpj`, `isin`, `ticker`) em N tabelas, em vez de uma FK para a tabela dona |
+## Fora de escopo (por ora)
 
-**Perfil dos dados**: só no sandbox, nunca em produção. Roda num job agendado e grava no índice.
-
-| Verificação | Como |
-|---|---|
-| Mesmo conteúdo em colunas diferentes | assinatura MinHash dos valores distintos de cada coluna; guarda só hashes, nunca os dados |
-| FK implícita | dependência de inclusão: todos os valores de `A.x` existem em `B.y` |
-| PK candidata | coluna (ou par de colunas) única e sem nulos |
-| Linhas duplicadas | hash da linha normalizada, mais comparação aproximada nas chaves de negócio |
-| Tabela derivada | a tabela nova é igual a um `JOIN`/`GROUP BY` de tabelas existentes, então deveria ser uma view |
-
-### LLM, só por cima da evidência
-
-- Sinônimos de nomes quando os números indicam a mesma coisa (`cod_cliente` ~ `client_id`)
-- Escolher entre reaproveitar, criar FK, transformar em view ou criar tabela nova, citando as métricas
-- Escrever a migration corrigida
-
-### Integração
-
-- Hook em `database/models/*.py`, `alembic/versions/*.py` e `*.sql`
-- `cpcheck db profile` (job) e `cpcheck db check <migration>` (hook/PR)
+GitHub Action, índice compartilhado entre repositórios, duplicidade de dados no Postgres, fórmulas fora de funções, detecção de algoritmos diferentes com o mesmo resultado. Reabrir só se o custo de manutenção compensar.

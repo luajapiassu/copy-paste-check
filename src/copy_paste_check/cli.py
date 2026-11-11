@@ -53,7 +53,7 @@ def cmd_check(a) -> int:
     for file in a.files:
         rel = idx.rel(file)
         source = Path(file).read_text(encoding="utf-8", errors="replace")
-        for f in extract_functions(source, rel, idx.min_tokens):
+        for f in extract_functions(source, rel, idx.min_tokens, idx.config.formula):
             ms = idx.query(f, limit=a.limit)
             if ms:
                 results.append((rel, f.qualname, f.lineno, ms))

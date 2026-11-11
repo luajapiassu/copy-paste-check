@@ -6,6 +6,8 @@ Princípio: **o máximo determinístico, LLM só para o que não dá para decidi
 
 ## Como detecta
 
+**Padrão leve:** só `exact` e `struct` (biblioteca padrão, ~0,2 s por checagem). `formula` e `near` são opcionais: ligue com `formula = true` / `near = true` no `.cpcheck.toml` (`formula` exige `pip install ".[formula]"`). Trocar essas opções recria o índice sozinho.
+
 Cada função vira um conjunto de impressões digitais, calculadas a partir da AST (não de regex):
 
 | Tipo | Técnica | Pega |
