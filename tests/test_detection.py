@@ -341,3 +341,28 @@ def test_new_worktree_is_seeded_from_another_one(tmp_path: Path):
     b.close()
     assert n > 0 and seeded == n  # veio pronto, antes de qualquer scan
     assert changed == (0, 0)  # arquivos iguais só atualizam o carimbo
+
+
+def test_index_recreated_when_detection_code_changes(repo, monkeypatch):
+    from copy_paste_check import index as index_mod
+
+    idx = Index(repo)
+    idx.scan()
+    idx.close()
+    idx = Index(repo)  # mesma versão: índice mantido
+    assert idx.db.execute("SELECT count(*) FROM functions").fetchone()[0] > 0
+    idx.close()
+    monkeypatch.setattr(index_mod, "_fingerprint", lambda config: "outra-versao")
+    idx = Index(repo)  # código mudou: recria sozinho, vazio
+    assert idx.db.execute("SELECT count(*) FROM functions").fetchone()[0] == 0
+    idx.close()
+
+
+def test_changing_min_tokens_recreates_index(repo):
+    first = Index(repo)
+    first.scan()
+    first.close()
+    cfg = Config(min_tokens=5)
+    idx = Index(repo, cfg)
+    assert idx.db.execute("SELECT count(*) FROM functions").fetchone()[0] == 0
+    idx.close()

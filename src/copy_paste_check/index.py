@@ -22,8 +22,32 @@ DEFAULT_EXCLUDE = [
     ".git/*", "*/.git/*", ".venv/*", "*/.venv/*", "venv/*", "node_modules/*", "*/node_modules/*",
     "*/__pycache__/*", "build/*", "dist/*", "*/alembic/versions/*", ".cpcheck/*",
 ]
-SCHEMA_VERSION = 3  # mudou o formato? o índice é recriado sozinho
+_CODE_FILES = ("extract.py", "formula.py", "minhash.py", "index.py")
+
+
+def _fingerprint(config: Config) -> str:
+    """Versão do índice = hash do código que decide o que é guardado + config que muda o conteúdo.
+
+    Qualquer ajuste na detecção (extrator, fórmulas, minhash, esquema) invalida o índice sozinho;
+    ninguém precisa lembrar de subir um número.
+    """
+    h = hashlib.blake2b(digest_size=8)
+    for name in _CODE_FILES:
+        h.update((Path(__file__).parent / name).read_bytes())
+    h.update(repr((config.formula, config.near, config.min_tokens, config.formula_exclude)).encode())
+    return h.hexdigest()
+
+
+def _db_version(db: sqlite3.Connection) -> str | None:
+    try:
+        row = db.execute("SELECT v FROM meta WHERE k='version'").fetchone()
+    except sqlite3.Error:  # sem tabela meta: índice de antes da versão automática
+        return None
+    return row[0] if row else None
+
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha TEXT NOT NULL, stamp TEXT);
 CREATE TABLE IF NOT EXISTS functions (
     id INTEGER PRIMARY KEY, path TEXT NOT NULL, qualname TEXT NOT NULL,
@@ -74,22 +98,22 @@ class Index:
         db_dir = self.root / ".cpcheck"
         db_dir.mkdir(exist_ok=True)
         db_path = db_dir / "index.db"
-        # trocar formula/near na config também recria o índice (ele guarda só o que está ligado)
-        version = SCHEMA_VERSION * 10 + self.config.formula + 2 * self.config.near
+        version = _fingerprint(self.config)
         if not db_path.exists():
             self._seed_from_worktree(db_path, version)
         self.db = sqlite3.connect(db_path)
-        if self.db.execute("PRAGMA user_version").fetchone()[0] != version:
-            self.db.close()
+        if self.db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] and _db_version(self.db) != version:
+            self.db.close()  # índice de outra versão do código/config: recria
             for suffix in ("", "-wal", "-shm"):
                 Path(f"{db_path}{suffix}").unlink(missing_ok=True)
             self.db = sqlite3.connect(db_path)
-            self.db.execute(f"PRAGMA user_version={version}")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
+        self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('version', ?)", (version,))
+        self.db.commit()
 
-    def _seed_from_worktree(self, db_path: Path, version: int) -> None:
+    def _seed_from_worktree(self, db_path: Path, version: str) -> None:
         """Worktree nova: copia o índice de outra worktree do mesmo repo (se tiver a mesma config).
 
         O índice depende só do conteúdo dos arquivos, e o scan compara hash antes de
@@ -106,7 +130,7 @@ class Index:
             try:
                 src = sqlite3.connect(src_path)  # backup() lê um retrato consistente, mesmo com scan rodando lá
                 try:
-                    if src.execute("PRAGMA user_version").fetchone()[0] != version:
+                    if _db_version(src) != version:
                         continue
                     dst = sqlite3.connect(db_path)
                     try:
