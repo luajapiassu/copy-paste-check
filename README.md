@@ -15,7 +15,7 @@ Cada função vira um conjunto de impressões digitais, calculadas a partir da A
 | `exact` | hash do corpo (ignora nome, docstring e comentários) | cópia idêntica |
 | `struct` | hash da AST com variáveis locais renomeadas (`v0`, `v1`…) e literais trocados pelo tipo | cópia com nomes ou valores trocados |
 | `formula` | toda expressão aritmética da função (não só o `return`), simplificada com sympy e invariante a nomes e ordem de variáveis | `(a - b) / b` = `a / b - 1`; `log(a) - log(b)` = `log(a / b)`; `df["close"] / df["close"].shift() - 1` = `precos.close.pct_change()` |
-| `near` | MinHash + LSH sobre a sequência de tokens | cópia com algumas linhas alteradas (similaridade ≥ 0,8) |
+| `near` | MinHash+LSH acha candidatos; a nota é o Jaccard dos shingles ponderado por raridade no repo (boilerplate pesa pouco) | cópia com algumas linhas alteradas (Jaccard ponderado por raridade ≥ 0,75) |
 
 O índice fica em SQLite (`.cpcheck/index.db` na raiz do repo) e é **incremental**: só reprocessa arquivos cujo tamanho ou data mudou.
 

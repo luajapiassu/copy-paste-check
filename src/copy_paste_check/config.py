@@ -6,7 +6,8 @@ Exemplo::
     min_tokens = 40
     formula = false   # true liga a camada de fórmulas (sympy)
     near = false      # true liga o MinHash (cópias aproximadas)
-    near_threshold = 0.8
+    near_threshold = 0.75
+    formula_max_funcs = 5
     # Duplicações intencionais: "glob do caminho::glob do nome da função".
     # Essas funções não são cobradas por serem cópia, mas continuam aparecendo
     # como origem a reutilizar quando alguém cria uma cópia nova em outro lugar.
@@ -28,7 +29,9 @@ class Config:
     # Camadas caras, desligadas por padrão: exact/struct são sempre ligadas.
     formula: bool = False  # exige sympy (pip install ".[formula]")
     near: bool = False
-    near_threshold: float = 0.8
+    near_threshold: float = 0.75
+    # Fórmula que aparece em mais funções que isso é idioma, não duplicata.
+    formula_max_funcs: int = 5
     allow: list[str] = field(default_factory=list)
     # Em testes é normal repetir a conta do código testado; não indexa fórmulas ali.
     formula_exclude: list[str] = field(
@@ -58,5 +61,5 @@ class Config:
                 data = data.get("tool", {}).get("cpcheck", {})
             except tomllib.TOMLDecodeError:
                 data = {}
-        known = {k: data[k] for k in ("exclude", "min_tokens", "formula", "near", "near_threshold", "allow", "formula_exclude") if k in data}
+        known = {k: data[k] for k in ("exclude", "min_tokens", "formula", "near", "near_threshold", "formula_max_funcs", "allow", "formula_exclude") if k in data}
         return cls(**known)

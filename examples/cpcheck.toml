@@ -8,7 +8,10 @@ exclude = ["pocs/*", "scripts/_backfill_*.py"]
 min_tokens = 40
 
 # Similaridade mínima (0 a 1) para o tipo "near".
-near_threshold = 0.8
+near_threshold = 0.75
+
+# Fórmula presente em mais funções que isso é idioma do projeto (ex.: 100 * a / b) e não é cobrada.
+formula_max_funcs = 5
 
 # Duplicações intencionais: "glob do caminho::glob do nome da função".
 # Não são cobradas por serem cópia, mas continuam aparecendo como origem

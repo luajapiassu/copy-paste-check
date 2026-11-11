@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import math
 import os
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,14 +22,15 @@ DEFAULT_EXCLUDE = [
     ".git/*", "*/.git/*", ".venv/*", "*/.venv/*", "venv/*", "node_modules/*", "*/node_modules/*",
     "*/__pycache__/*", "build/*", "dist/*", "*/alembic/versions/*", ".cpcheck/*",
 ]
-SCHEMA_VERSION = 2  # mudou o formato? o índice é recriado sozinho
+SCHEMA_VERSION = 3  # mudou o formato? o índice é recriado sozinho
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha TEXT NOT NULL, stamp TEXT);
 CREATE TABLE IF NOT EXISTS functions (
     id INTEGER PRIMARY KEY, path TEXT NOT NULL, qualname TEXT NOT NULL,
     lineno INTEGER, end_lineno INTEGER, n_tokens INTEGER,
-    h_exact TEXT, h_struct TEXT, sig BLOB
+    h_exact TEXT, h_struct TEXT, sig BLOB, shingles BLOB
 );
+CREATE TABLE IF NOT EXISTS sdf (h INTEGER PRIMARY KEY, n INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS formulas (canon TEXT NOT NULL, fn_id INTEGER NOT NULL, lineno INTEGER);
 CREATE INDEX IF NOT EXISTS ix_formula ON formulas(canon);
 CREATE INDEX IF NOT EXISTS ix_formula_fn ON formulas(fn_id);
@@ -71,9 +74,11 @@ class Index:
         db_dir = self.root / ".cpcheck"
         db_dir.mkdir(exist_ok=True)
         db_path = db_dir / "index.db"
-        self.db = sqlite3.connect(db_path)
         # trocar formula/near na config também recria o índice (ele guarda só o que está ligado)
         version = SCHEMA_VERSION * 10 + self.config.formula + 2 * self.config.near
+        if not db_path.exists():
+            self._seed_from_worktree(db_path, version)
+        self.db = sqlite3.connect(db_path)
         if self.db.execute("PRAGMA user_version").fetchone()[0] != version:
             self.db.close()
             for suffix in ("", "-wal", "-shm"):
@@ -83,6 +88,36 @@ class Index:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
+
+    def _seed_from_worktree(self, db_path: Path, version: int) -> None:
+        """Worktree nova: copia o índice de outra worktree do mesmo repo (se tiver a mesma config).
+
+        O índice depende só do conteúdo dos arquivos, e o scan compara hash antes de
+        reanalisar, então o que for igual à worktree de origem não custa nada.
+        """
+        try:
+            out = subprocess.run(["git", "-C", str(self.root), "worktree", "list", "--porcelain"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return
+        others = [Path(line[9:]) / ".cpcheck" / "index.db" for line in out.splitlines() if line.startswith("worktree ")]
+        others = [c for c in others if c.exists() and c.parent.parent.resolve() != self.root]
+        for src_path in sorted(others, key=lambda c: c.stat().st_mtime, reverse=True):
+            try:
+                src = sqlite3.connect(src_path)  # backup() lê um retrato consistente, mesmo com scan rodando lá
+                try:
+                    if src.execute("PRAGMA user_version").fetchone()[0] != version:
+                        continue
+                    dst = sqlite3.connect(db_path)
+                    try:
+                        src.backup(dst)
+                    finally:
+                        dst.close()
+                    return
+                finally:
+                    src.close()
+            except sqlite3.Error:
+                db_path.unlink(missing_ok=True)
 
     def close(self) -> None:
         self.db.close()
@@ -111,6 +146,9 @@ class Index:
                         yield rel
 
     def _delete(self, rel: str) -> None:
+        if self.config.near:  # desconta os shingles da frequência global
+            for (blob,) in self.db.execute("SELECT shingles FROM functions WHERE path=? AND shingles IS NOT NULL", (rel,)):
+                self.db.executemany("UPDATE sdf SET n=n-1 WHERE h=?", [(h,) for h in minhash.from_bytes(blob)])
         self.db.execute("DELETE FROM bands WHERE fn_id IN (SELECT id FROM functions WHERE path=?)", (rel,))
         self.db.execute("DELETE FROM formulas WHERE fn_id IN (SELECT id FROM functions WHERE path=?)", (rel,))
         self.db.execute("DELETE FROM functions WHERE path=?", (rel,))
@@ -120,12 +158,16 @@ class Index:
         self.db.execute("INSERT OR REPLACE INTO files(path, sha, stamp) VALUES (?, ?, ?)", (rel, sha, stamp))
         for f in funcs:
             sig = minhash.signature(f.tokens) if self.config.near else None
+            ids = minhash.shingle_ids(f.tokens) if sig else None
             cur = self.db.execute(
-                "INSERT INTO functions(path, qualname, lineno, end_lineno, n_tokens, h_exact, h_struct, sig)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO functions(path, qualname, lineno, end_lineno, n_tokens, h_exact, h_struct, sig, shingles)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
                 (rel, f.qualname, f.lineno, f.end_lineno, f.n_tokens, f.h_exact, f.h_struct,
-                 minhash.to_bytes(sig) if sig else None),
+                 minhash.to_bytes(sig) if sig else None, minhash.to_bytes(ids) if ids else None),
             )
+            if ids:
+                self.db.executemany(
+                    "INSERT INTO sdf(h, n) VALUES (?, 1) ON CONFLICT(h) DO UPDATE SET n=n+1", [(h,) for h in ids])
             self.db.executemany(
                 "INSERT INTO formulas(canon, fn_id, lineno) VALUES (?, ?, ?)",
                 [(c, cur.lastrowid, ln) for c, ln in f.formulas] if self.config.formulas_enabled(rel) else [],
@@ -161,10 +203,21 @@ class Index:
         removed = [p for p in known if p not in seen]
         for rel in removed:
             self._delete(rel)
+        self.db.execute("DELETE FROM sdf WHERE n<=0")
         self.db.commit()
         return changed, len(removed)
 
     # ---- leitura -----------------------------------------------------------
+    def _idf(self, ids: set[int]) -> dict[int, float]:
+        """Peso log((N+1)/(df+1)) + 1 (suavizado, nunca zero) de cada shingle; df vem da tabela ``sdf``."""
+        total = self.db.execute("SELECT count(*) FROM functions").fetchone()[0] + 1
+        df: dict[int, int] = {}
+        pool = list(ids)
+        for i in range(0, len(pool), 500):
+            chunk = pool[i : i + 500]
+            df.update(self.db.execute(f"SELECT h, n FROM sdf WHERE h IN ({','.join('?' * len(chunk))})", chunk))
+        return {h: math.log(total / (df.get(h, 0) + 1)) + 1 for h in ids}
+
     def query(self, f: FunctionInfo, limit: int = 3) -> list[Match]:
         """Procura duplicatas de ``f`` no índice, ignorando a própria função.
 
@@ -180,28 +233,40 @@ class Index:
         def add(kind: str, score: float, rows) -> None:
             for path, qual, line in rows:
                 key = (path, qual)
-                if key != own and key not in found:
+                # função aninhada x pai (render_tab._ytd x render_tab) não é duplicata
+                nested = path == f.path and (qual.startswith(f.qualname + ".") or f.qualname.startswith(qual + "."))
+                if key != own and not nested and key not in found:
                     found[key] = Match(kind, score, path, qual, line)
 
         add("exact", 1.0, self.db.execute("SELECT path, qualname, lineno FROM functions WHERE h_exact=?", (f.h_exact,)))
         add("struct", 1.0, self.db.execute("SELECT path, qualname, lineno FROM functions WHERE h_struct=?", (f.h_struct,)))
         for canon, _ in (f.formulas if self.config.formula and self.config.formulas_enabled(f.path) else []):
-            add("formula", 1.0, self.db.execute(
-                "SELECT fn.path, fn.qualname, fo.lineno FROM formulas fo JOIN functions fn ON fn.id=fo.fn_id"
-                " WHERE fo.canon=?", (canon,)))
+            rows = self.db.execute(
+                "SELECT fn.path, fn.qualname, fo.lineno, fn.id FROM formulas fo JOIN functions fn ON fn.id=fo.fn_id"
+                " WHERE fo.canon=?", (canon,)).fetchall()
+            # fórmula em funções demais é idioma do projeto (ex.: 100 * a / b), não cópia
+            if len({r[3] for r in rows}) <= self.config.formula_max_funcs:
+                add("formula", 1.0, [r[:3] for r in rows])
 
         if self.config.near and f.n_tokens >= self.min_tokens and len(found) < limit:
             sig = minhash.signature(f.tokens)
             band_list = minhash.bands(sig)
             marks = ",".join("?" * len(band_list))
             rows = self.db.execute(
-                f"SELECT DISTINCT fn.path, fn.qualname, fn.lineno, fn.sig FROM bands b JOIN functions fn ON fn.id=b.fn_id"
+                f"SELECT DISTINCT fn.path, fn.qualname, fn.lineno, fn.shingles FROM bands b JOIN functions fn ON fn.id=b.fn_id"
                 f" WHERE b.band IN ({marks})",
                 band_list,
             ).fetchall()
+            # O LSH só acha candidatos. A nota final pondera cada shingle pela raridade no repo
+            # (idf), então boilerplate compartilhado por muitas funções (CRUD, try/commit/return)
+            # pesa pouco e o conteúdo raro em comum pesa muito.
+            mine = set(minhash.shingle_ids(f.tokens))
+            cands = [(p, q, ln, set(minhash.from_bytes(b))) for p, q, ln, b in rows if b]
+            weight = self._idf(mine.union(*(c[3] for c in cands)))
             near = []
-            for path, qual, line, blob in rows:
-                score = minhash.similarity(sig, minhash.from_bytes(blob))
+            for path, qual, line, theirs in cands:
+                union = sum(weight[h] for h in mine | theirs)
+                score = sum(weight[h] for h in mine & theirs) / union if union else 0.0
                 if score >= near_threshold:
                     near.append((score, path, qual, line))
             for score, path, qual, line in sorted(near, reverse=True):
