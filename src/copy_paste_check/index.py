@@ -11,6 +11,7 @@ import math
 import os
 import sqlite3
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,6 +66,19 @@ CREATE TABLE IF NOT EXISTS bands (band TEXT NOT NULL, fn_id INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_band ON bands(band);
 CREATE INDEX IF NOT EXISTS ix_band_fn ON bands(fn_id);
 """
+
+
+PARALLEL_MIN_FILES = 40  # abaixo disso o custo de subir processos (spawn no Windows) não compensa
+
+
+def _analyze(job: tuple[str, str, int, bool, bool]):
+    """Parte pura e cara do scan (parse + impressões + minhash); roda em processo separado."""
+    rel, source, min_tokens, formula, near = job
+    out = []
+    for f in extract_functions(source, rel, min_tokens, formula):
+        sig = minhash.signature(f.tokens) if near else None
+        out.append((f, sig, minhash.shingle_ids(f.tokens) if sig else None))
+    return out
 
 
 @dataclass(slots=True, frozen=True)
@@ -178,11 +192,9 @@ class Index:
         self.db.execute("DELETE FROM functions WHERE path=?", (rel,))
         self.db.execute("DELETE FROM files WHERE path=?", (rel,))
 
-    def _insert(self, rel: str, sha: str, stamp: str, funcs: list[FunctionInfo]) -> None:
+    def _insert(self, rel: str, sha: str, stamp: str, funcs: list) -> None:
         self.db.execute("INSERT OR REPLACE INTO files(path, sha, stamp) VALUES (?, ?, ?)", (rel, sha, stamp))
-        for f in funcs:
-            sig = minhash.signature(f.tokens) if self.config.near else None
-            ids = minhash.shingle_ids(f.tokens) if sig else None
+        for f, sig, ids in funcs:
             cur = self.db.execute(
                 "INSERT INTO functions(path, qualname, lineno, end_lineno, n_tokens, h_exact, h_struct, sig, shingles)"
                 " VALUES (?,?,?,?,?,?,?,?,?)",
@@ -206,7 +218,7 @@ class Index:
         exclude = DEFAULT_EXCLUDE + self.config.exclude + (exclude or [])
         known = {p: (sha, stamp) for p, sha, stamp in self.db.execute("SELECT path, sha, stamp FROM files")}
         seen: set[str] = set()
-        changed = 0
+        todo: list[tuple[str, str, str, str]] = []  # (rel, sha, stamp, source)
         for rel in self._iter_py(exclude):
             seen.add(rel)
             path = self.root / rel
@@ -221,9 +233,16 @@ class Index:
                 self.db.execute("UPDATE files SET stamp=? WHERE path=?", (stamp, rel))
                 continue
             self._delete(rel)
-            source = data.decode("utf-8", errors="replace")
-            self._insert(rel, sha, stamp, extract_functions(source, rel, self.min_tokens, self.config.formula))
-            changed += 1
+            todo.append((rel, sha, stamp, data.decode("utf-8", errors="replace")))
+        jobs = [(rel, src, self.min_tokens, self.config.formula, self.config.near) for rel, _, _, src in todo]
+        if len(jobs) >= PARALLEL_MIN_FILES:
+            with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+                analyzed = list(pool.map(_analyze, jobs, chunksize=8))
+        else:
+            analyzed = [_analyze(j) for j in jobs]
+        for (rel, sha, stamp, _), funcs in zip(todo, analyzed):
+            self._insert(rel, sha, stamp, funcs)
+        changed = len(todo)
         removed = [p for p in known if p not in seen]
         for rel in removed:
             self._delete(rel)

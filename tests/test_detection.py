@@ -366,3 +366,22 @@ def test_changing_min_tokens_recreates_index(repo):
     idx = Index(repo, cfg)
     assert idx.db.execute("SELECT count(*) FROM functions").fetchone()[0] == 0
     idx.close()
+
+
+def test_parallel_scan_matches_serial(repo, tmp_path_factory, monkeypatch):
+    from copy_paste_check import index as index_mod
+
+    def dump(root: Path):
+        idx = Index(root, Config(near=True, min_tokens=1))
+        idx.scan()
+        rows = idx.db.execute("SELECT path, qualname, h_exact, h_struct, sig FROM functions ORDER BY path, qualname").fetchall()
+        idx.close()
+        return rows
+
+    serial = dump(repo)
+    other = tmp_path_factory.mktemp("par")
+    (other / ".git").mkdir()
+    (other / "shared").mkdir()
+    (other / "shared" / "calc.py").write_text(ORIGINAL)
+    monkeypatch.setattr(index_mod, "PARALLEL_MIN_FILES", 1)
+    assert dump(other) == serial and serial
