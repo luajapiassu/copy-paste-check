@@ -44,6 +44,19 @@ Rodado no wright-apps (branch sem commits, 20 `.py` mexidos, 36 funções novas/
 - [ ] **Isolamento do CLI depende de flags do `claude`** (`--strict-mcp-config --disable-slash-commands --setting-sources ""`): sem eles, ~107 mil tokens de entrada por chamada. Teste que falha se a chamada "oi" passar de ~5 mil tokens, para pegar mudança de versão do CLI.
 - [ ] **Latência do `judge`** ~8 s por par ambíguo, ~15-20 s com CLI frio: avaliar chamadas em paralelo (hoje sequencial).
 
+### Simulação da chamada 2 em lote (2026-11-12, `cpc/sim_lote.py`)
+
+9 funções (5 plantadas com gabarito + 4 novas reais da branch). Uma chamada: 42 s, US$ 0,009, 4/5 plantadas certas. 3 lotes paralelos: 32 s, US$ 0,033, acurácia pior. Desenho combinado: chamada 1 julga os pares similares, chamada 2 procura mesma intenção nas funções que passaram.
+
+- [ ] **Cálculo não é achado.** `_vol_anual` (preços, janela em dias, ddof=1, ×√252) não chegou em `shared/quant_tools/windows.py:vol_trailing`, que é a cópia; parou em `volatilidade_anualizada` (recebe retornos). Fórmula com outro nome/estrutura escapa do índice e da busca do Haiku.
+- [ ] **Falso positivo por padrão de código.** `remover_senha` saiu "USAR `pi.py:1416`" porque os dois fazem filtro + delete + 404, mas apagam entidades diferentes. Mesmo esqueleto CRUD/endpoint não é duplicata.
+- [ ] **Custo e latência.** ~40 s e US$ 0,009 por PR na chamada 2, quase tudo em voltas de `Grep`/`Read` do Haiku (cada volta = ida e vinda ao modelo + CLI). Baratear antes de ligar no pr-review.
+  - **Protótipo (2026-11-12, `cpc/sim_vocab.py`):** busca local sem LLM (FTS5/BM25 do SQLite sobre vocabulário de cada função: nome, docstring, nomes/atributos usados, constantes como 252; 3.166 funções em ~2 s) → top-8 candidatas → **uma** chamada ao Haiku **sem ferramentas** com a função nova + candidatas.
+  - Agêntico (antes): 42 s, US$ 0,0085, 4/5 plantadas.
+  - Local + 12 linhas por candidata + `MAX_THINKING_TOKENS=2048`: **26 s, US$ 0,0086, 9/9**, sem o falso positivo do `remover_senha` e achando `vol_trailing` (resolve também os dois itens acima nesta amostra).
+  - Sem pensamento: 8 s, mas apontou a própria função nova em 3 itens e inventou diferença de `ddof`. 6 linhas por candidata: 8 s, US$ 0,005, errou 4/9. Não cortar abaixo de 12 linhas + pensamento.
+  - O custo em US$ ficou igual: agora é a entrada (~20 mil tokens de candidatas). Próximo corte: juntar chamada 1 (pares do índice) e chamada 2 na mesma chamada (os pares do `near`/`formula` viram candidatas também) → 1 chamada por PR em vez de 2; e não chamar quando não há função nova fora de teste. Amostra de 9 itens: repetir com 20+ antes de cravar.
+
 ## Pontas soltas
 
 - [ ] Integração do passo Haiku no pr-review (ver Pendente)
