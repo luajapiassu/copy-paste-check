@@ -63,29 +63,38 @@ def cmd_check(a) -> int:
 
 
 def _git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=True).stdout
+    # utf-8 explícito: no Windows o padrão cp1252 quebra com acento e o stdout volta None
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, check=True,
+                          encoding="utf-8", errors="replace").stdout
+
+
+def _changed_funcs(idx: Index, base: str):
+    """Funções novas/alteradas da working tree (commits + não commitado + não rastreado) vs merge-base com ``base``."""
+    mb = _git(idx.root, "merge-base", base, "HEAD").strip()
+    files = _git(idx.root, "diff", "--name-only", "--diff-filter=AMR", mb).splitlines()
+    files += _git(idx.root, "ls-files", "--others", "--exclude-standard").splitlines()
+    for rel in dict.fromkeys(p for p in files if p.endswith(".py")):
+        path = idx.root / rel
+        if not path.exists():
+            continue
+        try:
+            before = _git(idx.root, "show", f"{mb}:{rel}")
+        except subprocess.CalledProcessError:
+            before = ""
+        after = path.read_text(encoding="utf-8", errors="replace")
+        yield rel, hook.new_or_changed(before, after, rel, idx.min_tokens)
+
+
+def _query_all(idx: Index, changed, limit: int) -> list:
+    return [(rel, f.qualname, f.lineno, ms) for rel, funcs in changed for f in funcs
+            if (ms := idx.query(f, limit=limit))]
 
 
 def cmd_diff(a) -> int:
     """Checa só funções novas/alteradas em relação a ``--base`` (uso em PR)."""
     idx = _open(a.root)
     idx.scan()
-    files = [p for p in _git(idx.root, "diff", "--name-only", "--diff-filter=AMR", f"{a.base}...HEAD").split()
-             if p.endswith(".py")]
-    results = []
-    for rel in files:
-        path = idx.root / rel
-        if not path.exists():
-            continue
-        try:
-            before = _git(idx.root, "show", f"{a.base}:{rel}")
-        except subprocess.CalledProcessError:
-            before = ""
-        after = path.read_text(encoding="utf-8", errors="replace")
-        for f in hook.new_or_changed(before, after, rel, idx.min_tokens):
-            ms = idx.query(f, limit=a.limit)
-            if ms:
-                results.append((rel, f.qualname, f.lineno, ms))
+    results = _query_all(idx, _changed_funcs(idx, a.base), a.limit)
     idx.close()
     if a.markdown:
         if results:
@@ -100,30 +109,13 @@ def cmd_diff(a) -> int:
 
 def _candidates(idx: Index, a) -> list:
     """Funções a julgar: as dos arquivos pedidos ou, sem arquivos, as novas/alteradas vs --base."""
-    results = []
-    if a.files:
-        files = [idx.rel(f) for f in a.files]
-    else:
-        files = [p for p in _git(idx.root, "diff", "--name-only", "--diff-filter=AMR", f"{a.base}...HEAD").split()
-                 if p.endswith(".py")]
-    for rel in files:
-        path = idx.root / rel
-        if not path.exists():
-            continue
-        after = path.read_text(encoding="utf-8", errors="replace")
-        if a.files:
-            funcs = extract_functions(after, rel, idx.min_tokens, idx.config.formula)
-        else:
-            try:
-                before = _git(idx.root, "show", f"{a.base}:{rel}")
-            except subprocess.CalledProcessError:
-                before = ""
-            funcs = hook.new_or_changed(before, after, rel, idx.min_tokens)
-        for f in funcs:
-            ms = idx.query(f, limit=a.limit)
-            if ms:
-                results.append((rel, f.qualname, f.lineno, ms))
-    return results
+    if not a.files:
+        return _query_all(idx, _changed_funcs(idx, a.base), a.limit)
+    rels = [idx.rel(f) for f in a.files]
+    changed = [(rel, extract_functions((idx.root / rel).read_text(encoding="utf-8", errors="replace"),
+                                       rel, idx.min_tokens, idx.config.formula))
+               for rel in rels if (idx.root / rel).exists()]
+    return _query_all(idx, changed, a.limit)
 
 
 def cmd_judge(a) -> int:

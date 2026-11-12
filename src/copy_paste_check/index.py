@@ -176,6 +176,7 @@ class Index:
             dirnames[:] = [
                 d for d in dirnames
                 if not any(fnmatch.fnmatch(f"{rel_dir}/{d}/x".lstrip("./"), pat) for pat in exclude)
+                and not os.path.exists(os.path.join(dirpath, d, ".git"))  # worktree/submódulo = outro checkout
             ]
             for name in filenames:
                 if name.endswith(".py"):

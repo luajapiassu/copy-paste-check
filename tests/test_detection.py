@@ -229,6 +229,35 @@ def test_cli_diff(repo: Path, capsys):
     assert "wavg" in out and "media_ponderada" in out
 
 
+def test_cli_diff_sees_uncommitted(repo: Path, capsys):
+    """PR em andamento: arquivo não rastreado (sem commit nenhum na branch) também conta."""
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                                    check=True, capture_output=True)
+    (repo / ".git").rmdir()
+    git("init", "-q", "-b", "main")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "feat")
+    (repo / "novo.py").write_text(ORIGINAL.replace("media_ponderada", "wavg"))  # não rastreado
+    code = main(["--root", str(repo), "diff", "--base", "main", "--markdown"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "wavg" in out and "media_ponderada" in out
+
+
+def test_scan_skips_nested_checkouts(repo: Path):
+    """.worktrees/x (ou submódulo) tem .git próprio: é outro checkout, não código deste."""
+    wt = repo / ".worktrees" / "outra"
+    (wt / "shared").mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: ../../.git/worktrees/outra\n")
+    (wt / "shared" / "calc.py").write_text(ORIGINAL)
+    idx = Index(repo)
+    idx.scan()
+    paths = {p for (p,) in idx.db.execute("SELECT DISTINCT path FROM functions")}
+    idx.close()
+    assert paths == {"shared/calc.py"}
+
+
 def test_config_allow_intentional_copies(repo: Path):
     (repo / ".cpcheck.toml").write_text('allow = ["templates/*.py::_parse"]\n')
     tpl = repo / "templates"
