@@ -30,6 +30,20 @@ Regra geral: **tudo que dá para provar com regra é determinístico; o LLM só 
 - [x] **Memória de vereditos do Haiku** (pares "coincidência"/"intencional") em arquivo versionado no repo, para não repetir falso positivo para todo mundo. Só depois do passo Haiku existir. **Feito (2026-11-11):** `cpcheck-verdicts.json` na raiz do projeto, chave = par de `h_exact` (qualquer mudança de código refaz o veredito).
 - [x] (Opcional) paralelizar o scan com `multiprocessing` para reduzir o primeiro scan por máquina (~10 s → 2–3 s). Descartados por custo de manutenção: GitHub Action/artefato de CI, índice no repo, blob no Azure. **Feito (2026-11-11):** `ProcessPoolExecutor` a partir de 40 arquivos; primeiro scan do corpus 7,1 s → 3,2 s, mesmos 358 pares.
 
+## Achados da simulação em PR real (2026-11-12) e do teste de modelos
+
+Rodado no wright-apps (branch sem commits, 20 `.py` mexidos, 36 funções novas/alteradas, índice de 847 arquivos, ~37 s, 3 chamadas ao Haiku). Resolver um por um:
+
+- [ ] **`diff` não vê working tree.** Só olha commits contra a base; na simulação precisei de script próprio (working tree vs `HEAD`). Adicionar `--worktree` (e arquivos não rastreados como "antes vazio") ao `cpcheck diff`/`judge`.
+- [ ] **Teste vs teste vira ruído.** Dos 4 candidatos, 2 eram testes irmãos no mesmo arquivo (`test_desbloquear_*`), julgados "coincidência" depois de gastar chamada. Avaliar não julgar (ou nem indexar no `near`) funções `test_*` do mesmo arquivo; helpers de teste (`_pdf_aberto`) continuam valendo.
+- [ ] **Achado real a devolver ao PR do wright-apps:** `_pdf_aberto()` em `apps/api/tests/test_extratos_router.py:436` é cópia de `_pdf_valido()` em `tests/unit/shared/test_relatorios_clientes.py:201` (PDF em branco 100x100 com pypdf). Mover para helper/conftest compartilhado. Fora do cpcheck, anotado aqui por ser o caso que a simulação achou.
+- [ ] **Haiku conservador demais.** Bloco OAuth + `sendMail` repetido em `send_movs_email`/`send_marketwatch_email`/`send_mmreport_email` saiu "coincidência" (nota 0,88-0,91), mas é duplicação real do bloco. Prompt pede conservadorismo; considerar veredito `parcial` (trecho comum extraível) e afrouxar.
+- [ ] **Mesma intenção, código diferente** (dia útil ANBIMA em `mail_saldo`/`mail_movs`/`cotas_email`) só o `ask` alcança; o `judge` não vê. Decidir se o hook/pr-review roda `ask` por função nova (custo ~US$ 0,003 no Haiku, ~17 s) ou só sob pedido.
+- [ ] **Limite do `near` em pares curtos:** par com cláusula extra fica em 0,60 (ruído chega a 0,71); xfail em `tests/labeled_near.py`. Ideias: shingles menores para função curta, ou subir o piso do ruído com mais pares rotulados.
+- [ ] **Modelo padrão e amostra maior.** Haiku 5.5 x Sonnet 5.5 empataram (15/16 e 3/3), Sonnet custa 7x no `judge` e 16x no `ask`; cada um oscilou 1 de 8 pares entre repetições. Rodar 30+ pares rotulados do corpus (`cpc/bench.py`) antes de cravar o padrão; hoje `CPCHECK_MODEL` ou `haiku`.
+- [ ] **Isolamento do CLI depende de flags do `claude`** (`--strict-mcp-config --disable-slash-commands --setting-sources ""`): sem eles, ~107 mil tokens de entrada por chamada. Teste que falha se a chamada "oi" passar de ~5 mil tokens, para pegar mudança de versão do CLI.
+- [ ] **Latência do `judge`** ~8 s por par ambíguo, ~15-20 s com CLI frio: avaliar chamadas em paralelo (hoje sequencial).
+
 ## Pontas soltas
 
 - [ ] Integração do passo Haiku no pr-review (ver Pendente)
