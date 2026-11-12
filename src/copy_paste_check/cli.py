@@ -7,12 +7,13 @@ import json
 import subprocess
 import sys
 from dataclasses import asdict
+from fnmatch import fnmatch
 from pathlib import Path
 
 from . import hook
 from . import judge as judge_mod
 from .extract import extract_functions
-from .index import Index, find_root
+from .index import DEFAULT_EXCLUDE, Index, find_root
 
 
 def _open(root: str | None) -> Index:
@@ -68,12 +69,19 @@ def _git(root: Path, *args: str) -> str:
                           encoding="utf-8", errors="replace").stdout
 
 
-def _changed_funcs(idx: Index, base: str):
+def _changed_funcs(idx: Index, base: str, min_tokens: int | None = None):
     """Funções novas/alteradas da working tree (commits + não commitado + não rastreado) vs merge-base com ``base``."""
+    for rel, before, after in _changed_sources(idx, base):
+        yield rel, hook.new_or_changed(before, after, rel, min_tokens or idx.min_tokens)
+
+
+def _changed_sources(idx: Index, base: str):
+    """(arquivo, código no merge-base, código na working tree) de cada .py mexido."""
     mb = _git(idx.root, "merge-base", base, "HEAD").strip()
     files = _git(idx.root, "diff", "--name-only", "--diff-filter=AMR", mb).splitlines()
     files += _git(idx.root, "ls-files", "--others", "--exclude-standard").splitlines()
-    for rel in dict.fromkeys(p for p in files if p.endswith(".py")):
+    skip = DEFAULT_EXCLUDE + idx.config.exclude  # migration, venv etc. também não contam no diff
+    for rel in dict.fromkeys(p for p in files if p.endswith(".py") and not any(fnmatch(p, s) for s in skip)):
         path = idx.root / rel
         if not path.exists():
             continue
@@ -81,8 +89,7 @@ def _changed_funcs(idx: Index, base: str):
             before = _git(idx.root, "show", f"{mb}:{rel}")
         except subprocess.CalledProcessError:
             before = ""
-        after = path.read_text(encoding="utf-8", errors="replace")
-        yield rel, hook.new_or_changed(before, after, rel, idx.min_tokens)
+        yield rel, before, path.read_text(encoding="utf-8", errors="replace")
 
 
 def _query_all(idx: Index, changed, limit: int) -> list:
@@ -134,6 +141,34 @@ def cmd_ask(a) -> int:
     return 0
 
 
+def review_input(idx: Index, base: str):
+    """Funções mexidas no PR e quais delas são novas (não existiam no merge-base)."""
+    changed, novas = [], set()
+    for rel, before, after in _changed_sources(idx, base):
+        funcs = hook.new_or_changed(before, after, rel, judge_mod.REVIEW_MIN_TOKENS)
+        old = {f.qualname for f in extract_functions(before, rel, 1, False)}
+        novas |= {(rel, f.qualname) for f in funcs if f.qualname not in old}
+        changed.append((rel, funcs))
+    return changed, novas
+
+
+def cmd_review(a) -> int:
+    """Uma passada por PR: execução das contas puras + uma chamada ao Haiku com as candidatas locais."""
+    idx = _open(a.root)
+    idx.scan()
+    changed, novas = review_input(idx, a.base)
+    found = judge_mod.review(idx, changed, execute=not a.no_exec, novas=novas)
+    idx.close()
+    for f in found:
+        where = f"{f.canonica.path}:{f.canonica.lineno} {f.canonica.qualname}" if f.canonica else "NAO EXISTE"
+        print(f"{f.path}:{f.lineno} {f.qualname} -> {where} [{f.origem}] {f.ressalva}")
+    for u in judge_mod.USAGE:
+        total = u["input"] + u["cache_write"] + u["cache_read"] + u["output"]
+        print(f"tokens: {total} (entrada {u['input']}, cache escrita {u['cache_write']}, cache leitura "
+              f"{u['cache_read']}, saída {u['output']}) | {u['ms'] / 1000:.1f} s no modelo", file=sys.stderr)
+    return 1 if a.fail_on == "found" and any(f.canonica for f in found) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="cpcheck", description="Detecta funções e fórmulas duplicadas.")
     p.add_argument("--root", help="raiz do repositório (padrão: procura .git a partir do cwd)")
@@ -169,6 +204,12 @@ def main(argv: list[str] | None = None) -> int:
     k = sub.add_parser("ask", help="busca prévia em linguagem natural (Haiku, só leitura)")
     k.add_argument("items", nargs="+", help="o que você vai precisar, ex.: 'lista de dias úteis entre datas'")
     k.set_defaults(fn=cmd_ask)
+
+    r = sub.add_parser("review", help="PR: execução das contas + 1 chamada ao Haiku com candidatas locais (vs --base)")
+    r.add_argument("--base", default="origin/main")
+    r.add_argument("--no-exec", action="store_true", help="não executa as funções de conta puras")
+    r.add_argument("--fail-on", choices=["found", "none"], default="none")
+    r.set_defaults(fn=cmd_review)
 
     h = sub.add_parser("hook", help="hook do Claude Code (lê JSON do stdin)")
     h.set_defaults(fn=lambda a: hook.run())

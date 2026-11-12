@@ -75,15 +75,18 @@ def _analyze(job: tuple[str, str, int, bool, bool]):
     """Parte pura e cara do scan (parse + impressões + minhash); roda em processo separado."""
     rel, source, min_tokens, formula, near = job
     out = []
-    for f in extract_functions(source, rel, min_tokens, formula):
+    every = extract_functions(source, rel, 1, formula)  # o vocabulário cobre até função curta (fold, é dia útil?)
+    for f in every:
+        if f.n_tokens < min_tokens and not f.formulas:
+            continue
         sig = minhash.signature(f.tokens) if near else None
         out.append((f, sig, minhash.shingle_ids(f.tokens) if sig else None))
-    return out
+    return out, [(f.qualname, f.lineno, f.vocab) for f in every]
 
 
 @dataclass(slots=True, frozen=True)
 class Match:
-    kind: str  # exact | struct | formula | near
+    kind: str  # exact | struct | formula | near | vocab | execucao | execucao~
     score: float
     path: str
     qualname: str
@@ -124,6 +127,12 @@ class Index:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
+        try:  # FTS5 vem no sqlite do Python oficial; sem ele a busca por vocabulário só fica vazia
+            self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS vocab USING fts5("
+                            "path UNINDEXED, qualname UNINDEXED, lineno UNINDEXED, body)")
+            self.has_vocab = True
+        except sqlite3.OperationalError:
+            self.has_vocab = False
         self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('version', ?)", (version,))
         self.db.commit()
 
@@ -191,10 +200,16 @@ class Index:
         self.db.execute("DELETE FROM bands WHERE fn_id IN (SELECT id FROM functions WHERE path=?)", (rel,))
         self.db.execute("DELETE FROM formulas WHERE fn_id IN (SELECT id FROM functions WHERE path=?)", (rel,))
         self.db.execute("DELETE FROM functions WHERE path=?", (rel,))
+        if self.has_vocab:
+            self.db.execute("DELETE FROM vocab WHERE path=?", (rel,))
         self.db.execute("DELETE FROM files WHERE path=?", (rel,))
 
-    def _insert(self, rel: str, sha: str, stamp: str, funcs: list) -> None:
+    def _insert(self, rel: str, sha: str, stamp: str, analyzed: tuple) -> None:
+        funcs, vocab = analyzed
         self.db.execute("INSERT OR REPLACE INTO files(path, sha, stamp) VALUES (?, ?, ?)", (rel, sha, stamp))
+        if self.has_vocab:
+            self.db.executemany("INSERT INTO vocab(path, qualname, lineno, body) VALUES (?,?,?,?)",
+                                [(rel, q, ln, v) for q, ln, v in vocab])
         for f, sig, ids in funcs:
             cur = self.db.execute(
                 "INSERT INTO functions(path, qualname, lineno, end_lineno, n_tokens, h_exact, h_struct, sig, shingles)"
@@ -261,6 +276,21 @@ class Index:
             chunk = pool[i : i + 500]
             df.update(self.db.execute(f"SELECT h, n FROM sdf WHERE h IN ({','.join('?' * len(chunk))})", chunk))
         return {h: math.log(total / (df.get(h, 0) + 1)) + 1 for h in ids}
+
+    def by_vocab(self, f: FunctionInfo, k: int = 8) -> list[Match]:
+        """Funções que usam as mesmas palavras (BM25): acha mesma intenção com código diferente.
+
+        Ignora arquivos de teste (helper de teste copiado aparece pelo ``query``) e a própria função.
+        """
+        terms = sorted(set(f.vocab.split()))
+        if not self.has_vocab or not terms:
+            return []
+        rows = self.db.execute(
+            "SELECT path, qualname, lineno, bm25(vocab) FROM vocab WHERE vocab MATCH ? ORDER BY bm25(vocab) LIMIT ?",
+            (" OR ".join(f'"{w}"' for w in terms), k + 20)).fetchall()
+        out = [Match("vocab", -score, p, q, ln) for p, q, ln, score in rows
+               if (p, q) != (f.path, f.qualname) and "test" not in p.rsplit("/", 1)[-1]]
+        return out[:k]
 
     def query(self, f: FunctionInfo, limit: int = 3) -> list[Match]:
         """Procura duplicatas de ``f`` no índice, ignorando a própria função.

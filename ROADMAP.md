@@ -48,9 +48,9 @@ Rodado no wright-apps (branch sem commits, 20 `.py` mexidos, 36 funções novas/
 
 9 funções (5 plantadas com gabarito + 4 novas reais da branch). Uma chamada: 42 s, US$ 0,009, 4/5 plantadas certas. 3 lotes paralelos: 32 s, US$ 0,033, acurácia pior. Desenho combinado: chamada 1 julga os pares similares, chamada 2 procura mesma intenção nas funções que passaram.
 
-- [ ] **Cálculo não é achado.** `_vol_anual` (preços, janela em dias, ddof=1, ×√252) não chegou em `shared/quant_tools/windows.py:vol_trailing`, que é a cópia; parou em `volatilidade_anualizada` (recebe retornos). Fórmula com outro nome/estrutura escapa do índice e da busca do Haiku.
-- [ ] **Falso positivo por padrão de código.** `remover_senha` saiu "USAR `pi.py:1416`" porque os dois fazem filtro + delete + 404, mas apagam entidades diferentes. Mesmo esqueleto CRUD/endpoint não é duplicata.
-- [ ] **Custo e latência.** ~40 s e US$ 0,009 por PR na chamada 2, quase tudo em voltas de `Grep`/`Read` do Haiku (cada volta = ida e vinda ao modelo + CLI). Baratear antes de ligar no pr-review.
+- [x] **Cálculo não é achado.** `_vol_anual` (preços, janela em dias, ddof=1, ×√252) não chegou em `shared/quant_tools/windows.py:vol_trailing`, que é a cópia; parou em `volatilidade_anualizada` (recebe retornos). Fórmula com outro nome/estrutura escapa do índice e da busca do Haiku.
+- [x] **Falso positivo por padrão de código.** `remover_senha` saiu "USAR `pi.py:1416`" porque os dois fazem filtro + delete + 404, mas apagam entidades diferentes. Mesmo esqueleto CRUD/endpoint não é duplicata.
+- [x] **Custo e latência.** ~40 s e US$ 0,009 por PR na chamada 2, quase tudo em voltas de `Grep`/`Read` do Haiku (cada volta = ida e vinda ao modelo + CLI). Baratear antes de ligar no pr-review.
   - **Protótipo (2026-11-12, `cpc/sim_vocab.py`):** busca local sem LLM (FTS5/BM25 do SQLite sobre vocabulário de cada função: nome, docstring, nomes/atributos usados, constantes como 252; 3.166 funções em ~2 s) → top-8 candidatas → **uma** chamada ao Haiku **sem ferramentas** com a função nova + candidatas.
   - Agêntico (antes): 42 s, US$ 0,0085, 4/5 plantadas.
   - Local + 12 linhas por candidata + `MAX_THINKING_TOKENS=2048`: **26 s, US$ 0,0086, 9/9**, sem o falso positivo do `remover_senha` e achando `vol_trailing` (resolve também os dois itens acima nesta amostra).
@@ -58,7 +58,24 @@ Rodado no wright-apps (branch sem commits, 20 `.py` mexidos, 36 funções novas/
   - O custo em US$ ficou igual: agora é a entrada (~20 mil tokens de candidatas). Próximo corte: juntar chamada 1 (pares do índice) e chamada 2 na mesma chamada (os pares do `near`/`formula` viram candidatas também) → 1 chamada por PR em vez de 2; e não chamar quando não há função nova fora de teste. Amostra de 9 itens: repetir com 20+ antes de cravar.
   - **Tokens (Wright usa assinatura, não API — medir em tokens):** `ask` agêntico 29–35 mil por item (bench); busca local + 1 chamada: 26,5 mil para 10 itens; `judge` ~2,4 mil por par. Juntar chamada 1 e 2 (pares do índice como candidatas) funcionou: `_pdf_aberto` → `_pdf_valido` na mesma chamada, 26,5 mil tokens, 24 s. Ganho de juntar é mais latência/processo do que token.
   - **Guarda determinística a fazer:** Haiku ainda aponta a própria função nova (1 de 10) mesmo com regra no prompt → descartar no código resposta que não está entre as candidatas do item ou que é a própria função.
-- [ ] **Impressão digital por execução (cálculos).** Protótipo `cpc/sim_exec.py`, sem LLM: funções de módulo **puras** (só `np`/`pd`/`math`/builtins seguros, sem import/IO/self) rodam num subprocesso `-I` com o Python do projeto, em entradas fixas (série de preços seed 0, retornos, janelas None/21/252); compara as saídas. `_vol_anual` → `vol_trailing` idêntica em 6/6 entradas; a mesma com `ddof=0` → "quase igual" (≤5%) em 6/6 e idêntica em 0/6 = mesma conta com parâmetro diferente. 0,7 s de execução. Limites: 103 puras no repo, só 24 ganham impressão (as outras recebem DataFrame/colunas/datas que o pool não gera); coleta do protótipo lenta (15 s, `rglob`) — no pacote usar o scan do índice.
+- [x] **Impressão digital por execução (cálculos).** Protótipo `cpc/sim_exec.py`, sem LLM: funções de módulo **puras** (só `np`/`pd`/`math`/builtins seguros, sem import/IO/self) rodam num subprocesso `-I` com o Python do projeto, em entradas fixas (série de preços seed 0, retornos, janelas None/21/252); compara as saídas. `_vol_anual` → `vol_trailing` idêntica em 6/6 entradas; a mesma com `ddof=0` → "quase igual" (≤5%) em 6/6 e idêntica em 0/6 = mesma conta com parâmetro diferente. 0,7 s de execução. Limites: 103 puras no repo, só 24 ganham impressão (as outras recebem DataFrame/colunas/datas que o pool não gera); coleta do protótipo lenta (15 s, `rglob`) — no pacote usar o scan do índice.
+
+### `cpcheck review` no pacote (2026-11-12)
+
+Feito: `execfp.py` (execução), tabela FTS5 `vocab` no índice (todas as funções, inclusive curtas), `judge.review` (chamada única) e `cpcheck review`. No wright-apps, branch real: **1 chamada, 13,8 mil tokens, 11,9 s, 7/7 certos** (`_pdf_aberto` → `_pdf_valido`; os outros 6 NAO EXISTE com a mais próxima na ressalva, inclusive `remover_senha`). Antes: 42,6 mil tokens para 17 itens. Execução no repo real: 1,7 s, acha `vol_trailing` e marca `ddof=0` como `execucao~`. O que foi preciso ajustar no caminho (cada um com teste):
+
+- Vocabulário só para função **nova** fora de teste: duplicata de função alterada já existia antes do PR (17 → 7 itens).
+- Função do próprio PR não entra como candidata do vocabulário (o índice tem a working tree; o Haiku tomava a irmã como "existente" e respondia a própria função).
+- Formato da resposta varia entre chamadas (`1.`, `→`, com/sem colchetes): parser aceita qualquer linha numerada com USAR/EXISTE; última linha do item vence.
+- Haiku usava USAR como "a mais próxima": prompt diz que USAR só quando substitui; senão NAO EXISTE com a mais próxima na ressalva.
+- Item sem resposta (o modelo parou no 2 de 7 uma vez) vai numa segunda chamada só com os faltantes.
+- `diff`/`review` respeitam `exclude` (migration não entra).
+
+Pendente:
+- [ ] Amostra maior com gabarito (20+), inclusive casos plantados no repo real, antes de pôr no pr-review.
+- [ ] `judge` e `ask` antigos ficaram; aposentar se o `review` cobrir (skill e README ainda citam).
+- [ ] Execução: só 24 das 103 funções puras aceitam as entradas fixas (DataFrame/colunas/datas ficam de fora).
+- [ ] wright-apps sem `.cpcheck.toml`: `near`/`formula` desligados por padrão, e o `_pdf_aberto` depende do `near`.
 
 ## Pontas soltas
 

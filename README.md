@@ -40,6 +40,12 @@ cpcheck diff --base origin/main --markdown   # saída pronta para comentário de
 
 `--fail-on strong|any|none` controla o exit code (padrão: `strong`, ou seja, falha só em `exact`/`struct`).
 
+`cpcheck review --base origin/main` é a passada completa de PR (working tree vs merge-base):
+
+1. **Execução** (sem LLM): funções de conta puras (só `np`/`pd`/`math`) rodam num subprocesso isolado com o Python do projeto em entradas fixas; mesmo resultado = mesma conta (`execucao`), até 5% = mesma conta com outro parâmetro, ex. `ddof` (`execucao~`).
+2. **Candidatas locais** (sem LLM): pares do índice + busca por vocabulário (FTS5/BM25: nome, docstring, o que a função usa, constantes como 252). Vocabulário só para função **nova** fora de teste; função alterada só vai adiante se o índice achar par.
+3. **Uma chamada ao Haiku, sem ferramentas**, com cada função e até 8 candidatas (12 linhas cada); resposta fora das candidatas é descartada. No wright-apps (7 funções): ~14 mil tokens, ~12 s. Pensamento limitado por `CPCHECK_THINKING` (padrão 2048).
+
 ### Hook do Claude Code
 
 Veja [`examples/claude-settings.json`](examples/claude-settings.json). O mesmo comando atende dois eventos:
