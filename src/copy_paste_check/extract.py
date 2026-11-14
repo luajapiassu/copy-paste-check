@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import re
 from dataclasses import dataclass, field
 
 from .formula import function_formulas
@@ -27,6 +28,7 @@ class FunctionInfo:
     h_struct: str
     tokens: list[str] = field(repr=False)
     formulas: list[tuple[str, int]] = field(default_factory=list)  # (forma canônica, linha)
+    vocab: str = ""  # palavras do nome, docstring, nomes/atributos usados e constantes (busca por intenção)
 
 
 def _strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
@@ -75,8 +77,9 @@ def _serialize(fn: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]) -> t
         exact.append(kind)
         if isinstance(node, ast.Name):
             exact.append(node.id)
-            toks.append(name(node.id))
-            struct.append(toks[-1])
+            struct.append(name(node.id))
+            # sem numerar: um parâmetro a mais não pode renomear todos os locais seguintes (v1→v2…)
+            toks.append("v" if node.id in local else node.id)
         elif isinstance(node, ast.arg):
             exact.append(node.arg)
             struct.append(name(node.arg))
@@ -117,6 +120,27 @@ def _serialize(fn: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]) -> t
     return exact, struct, toks
 
 
+_STOP = {"self", "none", "true", "false", "return", "the", "de", "da", "do", "e", "o", "a", "se", "em", "para", "com"}
+
+
+def _words(s: str) -> list[str]:
+    s = re.sub(r"([a-z])([A-Z])", r" ", s)
+    return [w.lower() for w in re.split(r"[^0-9a-zA-ZÀ-ÿ]+|_", s) if len(w) > 1 and w.lower() not in _STOP]
+
+
+def _vocab(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """Vocabulário da função para a busca por intenção (BM25): o que ela diz que faz e o que ela usa."""
+    out = _words(fn.name) + _words(ast.get_docstring(fn) or "")
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Attribute):
+            out += _words(n.attr)
+        elif isinstance(n, ast.Name):
+            out += _words(n.id)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and n.value not in (0, 1, -1, 2):
+            out.append(f"n{n.value}")  # 252, 365, 100… pesam muito em conta financeira
+    return " ".join(out)
+
+
 def _digest(text: str) -> str:
     return hashlib.blake2b(text.encode(), digest_size=12).hexdigest()
 
@@ -133,6 +157,7 @@ def fingerprint(fn: ast.FunctionDef | ast.AsyncFunctionDef, path: str, qualname:
         h_struct=_digest(" ".join(struct)),
         tokens=toks,
         formulas=function_formulas(fn) if formulas else [],
+        vocab=_vocab(fn),
     )
 
 

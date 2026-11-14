@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import array
 import hashlib
+import zlib
 
 K = 5
 NUM_PERM = 64
@@ -21,6 +22,11 @@ def _shingles(tokens: list[str]) -> set[str]:
     if len(tokens) < K:
         return {" ".join(tokens)}
     return {" ".join(tokens[i : i + K]) for i in range(len(tokens) - K + 1)}
+
+
+def shingle_ids(tokens: list[str]) -> list[int]:
+    """Ids estáveis (crc32) dos shingles distintos, para o Jaccard ponderado por raridade."""
+    return sorted({zlib.crc32(g.encode()) for g in _shingles(tokens)})
 
 
 def signature(tokens: list[str]) -> list[int]:

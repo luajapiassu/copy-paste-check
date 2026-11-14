@@ -133,7 +133,7 @@ def test_index_incremental(repo: Path):
 
 
 def test_query_near_clone(repo: Path):
-    (repo / ".cpcheck.toml").write_text("near = true\n")
+    (repo / ".cpcheck.toml").write_text("near = true\nnear_threshold = 0.6\n")
     idx = Index(repo)
     idx.scan()
     near = textwrap.dedent('''
@@ -229,6 +229,35 @@ def test_cli_diff(repo: Path, capsys):
     assert "wavg" in out and "media_ponderada" in out
 
 
+def test_cli_diff_sees_uncommitted(repo: Path, capsys):
+    """PR em andamento: arquivo não rastreado (sem commit nenhum na branch) também conta."""
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                                    check=True, capture_output=True)
+    (repo / ".git").rmdir()
+    git("init", "-q", "-b", "main")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "feat")
+    (repo / "novo.py").write_text(ORIGINAL.replace("media_ponderada", "wavg"))  # não rastreado
+    code = main(["--root", str(repo), "diff", "--base", "main", "--markdown"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "wavg" in out and "media_ponderada" in out
+
+
+def test_scan_skips_nested_checkouts(repo: Path):
+    """.worktrees/x (ou submódulo) tem .git próprio: é outro checkout, não código deste."""
+    wt = repo / ".worktrees" / "outra"
+    (wt / "shared").mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: ../../.git/worktrees/outra\n")
+    (wt / "shared" / "calc.py").write_text(ORIGINAL)
+    idx = Index(repo)
+    idx.scan()
+    paths = {p for (p,) in idx.db.execute("SELECT DISTINCT path FROM functions")}
+    idx.close()
+    assert paths == {"shared/calc.py"}
+
+
 def test_config_allow_intentional_copies(repo: Path):
     (repo / ".cpcheck.toml").write_text('allow = ["templates/*.py::_parse"]\n')
     tpl = repo / "templates"
@@ -261,3 +290,127 @@ def test_formula_and_near_off_by_default(repo: Path):
     assert idx.db.execute("SELECT count(*) FROM formulas").fetchone()[0] == 0
     assert idx.db.execute("SELECT count(*) FROM bands").fetchone()[0] == 0
     idx.close()
+
+
+def test_formula_idiom_in_many_functions_is_ignored(repo: Path):
+    (repo / ".cpcheck.toml").write_text("formula = true\nformula_max_funcs = 2\n")
+    for i in range(3):
+        (repo / "shared" / f"pct{i}.py").write_text(f"def pct{i}(a, b):\n    return 100 * a / b\n")
+    idx = Index(repo)
+    idx.scan()
+    f = fn("def novo(x, y):\n    return 100 * x / y\n", "novo")
+    kinds = {m.kind for m in idx.query(f)}
+    idx.close()
+    assert "formula" not in kinds
+
+
+def test_nested_function_is_not_duplicate_of_parent(repo: Path):
+    (repo / ".cpcheck.toml").write_text("formula = true\n")
+    (repo / "shared" / "n.py").write_text(
+        "def outer(r):\n    def inner(r):\n        return (1 + r) ** 3 - 1\n    return (1 + r) ** 3 - 1\n")
+    idx = Index(repo)
+    idx.scan()
+    f = next(f for f in extract_functions((repo / "shared" / "n.py").read_text(), "shared/n.py", 1, True)
+             if f.qualname == "outer")
+    matches = idx.query(f)
+    idx.close()
+    assert not any(m.qualname == "outer.inner" for m in matches)
+
+
+def _crud(name: str, extra: str) -> str:
+    return textwrap.dedent(f'''
+        def {name}(session, key, payload):
+            obj = session.get(Model, key)
+            if obj is None:
+                raise LookupError(key)
+            for field, value in payload.items():
+                setattr(obj, field, value)
+            {extra}
+            session.add(obj)
+            session.commit()
+            session.refresh(obj)
+            return obj
+    ''')
+
+
+def test_near_ignores_boilerplate_shared_by_many_functions(repo: Path):
+    (repo / ".cpcheck.toml").write_text("near = true\nnear_threshold = 0.75\n")
+    extras = ["log.info(obj)", "audit(obj, user)", "notify(obj.owner)", "cache.drop(key)", "metrics.hit(obj)", "obj.touch()"]
+    for i, extra in enumerate(extras):
+        (repo / "shared" / f"crud{i}.py").write_text(_crud(f"update_{i}", extra))
+    idx = Index(repo)
+    idx.scan()
+    boilerplate = fn(_crud("update_new", "queue.push(obj)"), "update_new")
+    clone_of_rare = fn(_crud("update_copy", extras[0]).replace("session.refresh(obj)", "session.expire(obj)"), "update_copy")
+    kinds = {m.kind for m in idx.query(boilerplate)}
+    idx.close()
+    assert "near" not in kinds
+    assert clone_of_rare  # só garante que o helper gera código válido
+
+
+def test_new_worktree_is_seeded_from_another_one(tmp_path: Path):
+    def git(*a, cwd):
+        subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True)
+
+    main = tmp_path / "main"
+    main.mkdir()
+    git("init", "-q", cwd=main)
+    (main / "calc.py").write_text(ORIGINAL)
+    git("-c", "user.name=t", "-c", "user.email=t@t", "add", ".", cwd=main)
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x", cwd=main)
+    a = Index(main)
+    a.scan()
+    n = a.db.execute("SELECT count(*) FROM functions").fetchone()[0]
+    a.close()
+    wt = tmp_path / "wt"
+    git("worktree", "add", "-q", str(wt), cwd=main)
+    b = Index(wt)
+    seeded = b.db.execute("SELECT count(*) FROM functions").fetchone()[0]
+    changed = b.scan()
+    b.close()
+    assert n > 0 and seeded == n  # veio pronto, antes de qualquer scan
+    assert changed == (0, 0)  # arquivos iguais só atualizam o carimbo
+
+
+def test_index_recreated_when_detection_code_changes(repo, monkeypatch):
+    from copy_paste_check import index as index_mod
+
+    idx = Index(repo)
+    idx.scan()
+    idx.close()
+    idx = Index(repo)  # mesma versão: índice mantido
+    assert idx.db.execute("SELECT count(*) FROM functions").fetchone()[0] > 0
+    idx.close()
+    monkeypatch.setattr(index_mod, "_fingerprint", lambda config: "outra-versao")
+    idx = Index(repo)  # código mudou: recria sozinho, vazio
+    assert idx.db.execute("SELECT count(*) FROM functions").fetchone()[0] == 0
+    idx.close()
+
+
+def test_changing_min_tokens_recreates_index(repo):
+    first = Index(repo)
+    first.scan()
+    first.close()
+    cfg = Config(min_tokens=5)
+    idx = Index(repo, cfg)
+    assert idx.db.execute("SELECT count(*) FROM functions").fetchone()[0] == 0
+    idx.close()
+
+
+def test_parallel_scan_matches_serial(repo, tmp_path_factory, monkeypatch):
+    from copy_paste_check import index as index_mod
+
+    def dump(root: Path):
+        idx = Index(root, Config(near=True, min_tokens=1))
+        idx.scan()
+        rows = idx.db.execute("SELECT path, qualname, h_exact, h_struct, sig FROM functions ORDER BY path, qualname").fetchall()
+        idx.close()
+        return rows
+
+    serial = dump(repo)
+    other = tmp_path_factory.mktemp("par")
+    (other / ".git").mkdir()
+    (other / "shared").mkdir()
+    (other / "shared" / "calc.py").write_text(ORIGINAL)
+    monkeypatch.setattr(index_mod, "PARALLEL_MIN_FILES", 1)
+    assert dump(other) == serial and serial

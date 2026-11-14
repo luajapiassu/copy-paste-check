@@ -7,11 +7,13 @@ import json
 import subprocess
 import sys
 from dataclasses import asdict
+from fnmatch import fnmatch
 from pathlib import Path
 
 from . import hook
+from . import judge as judge_mod
 from .extract import extract_functions
-from .index import Index, find_root
+from .index import DEFAULT_EXCLUDE, Index, find_root
 
 
 def _open(root: str | None) -> Index:
@@ -62,29 +64,44 @@ def cmd_check(a) -> int:
 
 
 def _git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=True).stdout
+    # utf-8 explícito: no Windows o padrão cp1252 quebra com acento e o stdout volta None
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, check=True,
+                          encoding="utf-8", errors="replace").stdout
+
+
+def _changed_funcs(idx: Index, base: str, min_tokens: int | None = None):
+    """Funções novas/alteradas da working tree (commits + não commitado + não rastreado) vs merge-base com ``base``."""
+    for rel, before, after in _changed_sources(idx, base):
+        yield rel, hook.new_or_changed(before, after, rel, min_tokens or idx.min_tokens)
+
+
+def _changed_sources(idx: Index, base: str):
+    """(arquivo, código no merge-base, código na working tree) de cada .py mexido."""
+    mb = _git(idx.root, "merge-base", base, "HEAD").strip()
+    files = _git(idx.root, "diff", "--name-only", "--diff-filter=AMR", mb).splitlines()
+    files += _git(idx.root, "ls-files", "--others", "--exclude-standard").splitlines()
+    skip = DEFAULT_EXCLUDE + idx.config.exclude  # migration, venv etc. também não contam no diff
+    for rel in dict.fromkeys(p for p in files if p.endswith(".py") and not any(fnmatch(p, s) for s in skip)):
+        path = idx.root / rel
+        if not path.exists():
+            continue
+        try:
+            before = _git(idx.root, "show", f"{mb}:{rel}")
+        except subprocess.CalledProcessError:
+            before = ""
+        yield rel, before, path.read_text(encoding="utf-8", errors="replace")
+
+
+def _query_all(idx: Index, changed, limit: int) -> list:
+    return [(rel, f.qualname, f.lineno, ms) for rel, funcs in changed for f in funcs
+            if (ms := idx.query(f, limit=limit))]
 
 
 def cmd_diff(a) -> int:
     """Checa só funções novas/alteradas em relação a ``--base`` (uso em PR)."""
     idx = _open(a.root)
     idx.scan()
-    files = [p for p in _git(idx.root, "diff", "--name-only", "--diff-filter=AMR", f"{a.base}...HEAD").split()
-             if p.endswith(".py")]
-    results = []
-    for rel in files:
-        path = idx.root / rel
-        if not path.exists():
-            continue
-        try:
-            before = _git(idx.root, "show", f"{a.base}:{rel}")
-        except subprocess.CalledProcessError:
-            before = ""
-        after = path.read_text(encoding="utf-8", errors="replace")
-        for f in hook.new_or_changed(before, after, rel, idx.min_tokens):
-            ms = idx.query(f, limit=a.limit)
-            if ms:
-                results.append((rel, f.qualname, f.lineno, ms))
+    results = _query_all(idx, _changed_funcs(idx, a.base), a.limit)
     idx.close()
     if a.markdown:
         if results:
@@ -95,6 +112,61 @@ def cmd_diff(a) -> int:
         kinds = {m.kind for *_, ms in results for m in ms}
         return 1 if (a.fail_on == "any" and kinds) or (a.fail_on == "strong" and kinds & hook.STRONG) else 0
     return _report(results, a.json, a.fail_on)
+
+
+def _candidates(idx: Index, a) -> list:
+    """Funções a julgar: as dos arquivos pedidos ou, sem arquivos, as novas/alteradas vs --base."""
+    if not a.files:
+        return _query_all(idx, _changed_funcs(idx, a.base), a.limit)
+    rels = [idx.rel(f) for f in a.files]
+    changed = [(rel, extract_functions((idx.root / rel).read_text(encoding="utf-8", errors="replace"),
+                                       rel, idx.min_tokens, idx.config.formula))
+               for rel in rels if (idx.root / rel).exists()]
+    return _query_all(idx, changed, a.limit)
+
+
+def cmd_judge(a) -> int:
+    idx = _open(a.root)
+    idx.scan()
+    verdicts = judge_mod.judge(idx, _candidates(idx, a), low=a.low, high=a.high, remember=not a.no_remember)
+    idx.close()
+    for v in verdicts:
+        print(f"{v.path}:{v.lineno} {v.qualname} ~ {v.other.path}:{v.other.lineno} {v.other.qualname}"
+              f" {v.other.kind}={v.other.score:.2f} [{v.veredito}/{v.origem}] -> {v.canonica} | {v.diferencas}")
+    return 1 if a.fail_on == "strong" and any(v.veredito == "duplicata" for v in verdicts) else 0
+
+
+def cmd_ask(a) -> int:
+    print(judge_mod.ask(Path(a.root) if a.root else find_root(Path.cwd()), a.items))
+    return 0
+
+
+def review_input(idx: Index, base: str):
+    """Funções mexidas no PR e quais delas são novas (não existiam no merge-base)."""
+    changed, novas = [], set()
+    for rel, before, after in _changed_sources(idx, base):
+        funcs = hook.new_or_changed(before, after, rel, judge_mod.REVIEW_MIN_TOKENS)
+        old = {f.qualname for f in extract_functions(before, rel, 1, False)}
+        novas |= {(rel, f.qualname) for f in funcs if f.qualname not in old}
+        changed.append((rel, funcs))
+    return changed, novas
+
+
+def cmd_review(a) -> int:
+    """Uma passada por PR: execução das contas puras + uma chamada ao Haiku com as candidatas locais."""
+    idx = _open(a.root)
+    idx.scan()
+    changed, novas = review_input(idx, a.base)
+    found = judge_mod.review(idx, changed, execute=not a.no_exec, novas=novas)
+    idx.close()
+    for f in found:
+        where = f"{f.canonica.path}:{f.canonica.lineno} {f.canonica.qualname}" if f.canonica else "NAO EXISTE"
+        print(f"{f.path}:{f.lineno} {f.qualname} -> {where} [{f.origem}] {f.ressalva}")
+    for u in judge_mod.USAGE:
+        total = u["input"] + u["cache_write"] + u["cache_read"] + u["output"]
+        print(f"tokens: {total} (entrada {u['input']}, cache escrita {u['cache_write']}, cache leitura "
+              f"{u['cache_read']}, saída {u['output']}) | {u['ms'] / 1000:.1f} s no modelo", file=sys.stderr)
+    return 1 if a.fail_on == "found" and any(f.canonica for f in found) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -119,9 +191,31 @@ def main(argv: list[str] | None = None) -> int:
         c.add_argument("--fail-on", choices=["strong", "any", "none"], default="strong")
         c.set_defaults(fn=fn)
 
+    j = sub.add_parser("judge", help="Haiku julga os candidatos ambíguos (near 0,70-0,85, formula); sem arquivos: o diff vs --base")
+    j.add_argument("files", nargs="*")
+    j.add_argument("--base", default="origin/main")
+    j.add_argument("--limit", type=int, default=3)
+    j.add_argument("--low", type=float, default=0.70)
+    j.add_argument("--high", type=float, default=0.95)
+    j.add_argument("--no-remember", action="store_true", help="não grava em cpcheck-verdicts.json")
+    j.add_argument("--fail-on", choices=["strong", "none"], default="none")
+    j.set_defaults(fn=cmd_judge)
+
+    k = sub.add_parser("ask", help="busca prévia em linguagem natural (Haiku, só leitura)")
+    k.add_argument("items", nargs="+", help="o que você vai precisar, ex.: 'lista de dias úteis entre datas'")
+    k.set_defaults(fn=cmd_ask)
+
+    r = sub.add_parser("review", help="PR: execução das contas + 1 chamada ao Haiku com candidatas locais (vs --base)")
+    r.add_argument("--base", default="origin/main")
+    r.add_argument("--no-exec", action="store_true", help="não executa as funções de conta puras")
+    r.add_argument("--fail-on", choices=["found", "none"], default="none")
+    r.set_defaults(fn=cmd_review)
+
     h = sub.add_parser("hook", help="hook do Claude Code (lê JSON do stdin)")
     h.set_defaults(fn=lambda a: hook.run())
 
+    for stream in (sys.stdout, sys.stderr):  # Windows cp1252 não imprime setas nem acentos do modelo
+        stream.reconfigure(encoding="utf-8", errors="replace")
     a = p.parse_args(argv)
     return a.fn(a)
 
