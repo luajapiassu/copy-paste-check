@@ -1,8 +1,48 @@
 # copy-paste-check
 
-Detecta **funções e fórmulas duplicadas** em código Python antes que elas entrem no repositório: no momento em que o agente (Claude Code) escreve o arquivo, e de novo na revisão do PR.
+**A mesma conta, escrita duas vezes, um dia dá dois números.**
+copy-paste-check acha funções e fórmulas duplicadas em Python no momento em que o agente (Claude Code) escreve o arquivo, e de novo na revisão do PR.
 
 Princípio: **o máximo determinístico, LLM só para o que não dá para decidir com regra.** O caminho rápido (hook e CLI) não chama nenhum modelo e não imprime nada quando não encontra duplicata. Isso mantém o custo de tokens perto de zero.
+
+## Exemplo: a volatilidade do fundo
+
+[`examples/vol/`](examples/vol) já tem a conta, escrita e validada uma vez:
+
+```python
+# shared/risco.py
+def vol_anualizada(retornos, dias_uteis=252):
+    validos = retornos.dropna()
+    if len(validos) < 2:
+        return float("nan")
+    return float(validos.std(ddof=1) * np.sqrt(dias_uteis))
+```
+
+**Pedido novo:** "Claude, põe a vol dos últimos 12 meses no resumo."
+
+**Sem copy-paste-check:** o Claude escreveu a própria `volatilidade`, com outros nomes e a mesma conta.
+
+<img src="media/vol_sem.gif" width="480" alt="O agente recria a volatilidade em relatorio.py">
+
+*Duas vols no repo. No dia em que alguém trocar o `ddof` de uma, o relatório e o painel discordam.*
+
+**Com copy-paste-check:** o hook nega a escrita antes de o arquivo existir, e diz onde está a original:
+
+<img src="media/vol_bloqueio.gif" width="480" alt="O hook PreToolUse nega a escrita: volatilidade ≈ vol_anualizada [struct]">
+
+```
+cpcheck: já existe função equivalente no repo:
+- `volatilidade` (nova) ≈ `vol_anualizada` em shared/risco.py:4 [struct]
+Importe e use a existente em vez de recriar.
+```
+
+O Claude tentou de novo e importou a existente:
+
+<img src="media/vol_reuso.gif" width="480" alt="relatorio.py reusa vol_anualizada; o hook não diz nada">
+
+*Uma vol só. Custo da checagem: zero tokens.*
+
+Os GIFs são gerados por [`media/demo.py`](media/demo.py): ele passa as duas versões de `relatorio.py` pelo hook de verdade, confere o veredito e desenha o texto que o hook devolveu.
 
 ## Como detecta
 
@@ -70,3 +110,7 @@ Testado em sessão real do Claude Code (`claude -p`): o bloqueio impede a escrit
 ## Roadmap
 
 Ver [`ROADMAP.md`](ROADMAP.md) — inclui a frente de **duplicidade de dados no Postgres** (reaproveitamento via PK/FK).
+
+## Licença
+
+[MIT](LICENSE)
