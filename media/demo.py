@@ -129,7 +129,7 @@ def main():
         assert bloqueio and bloqueio[0] == "block", bloqueio
         assert hook(project, REUSO) is None
 
-    title = "relatorio.py  (Claude, pedido: vol dos últimos 12 meses)"
+    title = "Claude, pedido: vol dos últimos 12 meses"
     motivo = " ".join(bloqueio[1]).replace("`", "")
     save("vol_sem", typing(title, COPIA, (YELLOW, ["sem cpcheck: merged.", "Agora são duas vols no repo."])))
     save("vol_bloqueio", typing(title, COPIA, (RED, ["cpcheck (PreToolUse): escrita negada", *wrap(motivo)])))
