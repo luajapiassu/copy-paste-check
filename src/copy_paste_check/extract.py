@@ -28,6 +28,7 @@ class FunctionInfo:
     h_struct: str
     tokens: list[str] = field(repr=False)
     formulas: list[tuple[str, int]] = field(default_factory=list)  # (forma canônica, linha)
+    h_lit: str = ""  # hash dos literais: separa "mesma estrutura" de "mesma estrutura e mesmos valores"
     vocab: str = ""  # palavras do nome, docstring, nomes/atributos usados e constantes (busca por intenção)
 
 
@@ -53,7 +54,7 @@ def _local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
 _SKIP = (ast.expr_context, ast.operator, ast.unaryop, ast.boolop, ast.cmpop)
 
 
-def _serialize(fn: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]) -> tuple[list[str], list[str], list[str]]:
+def _serialize(fn: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]) -> tuple[list[str], list[str], list[str], list[str]]:
     """Uma passada em pré-ordem (ordem do código), sem copiar a árvore.
 
     Devolve ``(exato, estrutura, tokens)``: ``exato`` mantém nomes e literais
@@ -66,6 +67,7 @@ def _serialize(fn: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]) -> t
     exact: list[str] = []
     struct: list[str] = []
     toks: list[str] = []
+    lits: list[str] = []
 
     def name(n: str) -> str:
         return mapping.setdefault(n, f"v{len(mapping)}") if n in local else n
@@ -86,6 +88,7 @@ def _serialize(fn: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]) -> t
             return  # anotações de tipo não contam
         elif isinstance(node, ast.Constant):
             exact.append(repr(node.value))
+            lits.append(exact[-1])
             struct.append(type(node.value).__name__)
         elif isinstance(node, ast.Attribute):
             toks.append("." + node.attr)
@@ -117,14 +120,14 @@ def _serialize(fn: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]) -> t
     visit(fn.args)
     for stmt in _strip_docstring(fn.body):
         visit(stmt)
-    return exact, struct, toks
+    return exact, struct, toks, lits
 
 
 _STOP = {"self", "none", "true", "false", "return", "the", "de", "da", "do", "e", "o", "a", "se", "em", "para", "com"}
 
 
 def _words(s: str) -> list[str]:
-    s = re.sub(r"([a-z])([A-Z])", r" ", s)
+    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
     return [w.lower() for w in re.split(r"[^0-9a-zA-ZÀ-ÿ]+|_", s) if len(w) > 1 and w.lower() not in _STOP]
 
 
@@ -146,7 +149,7 @@ def _digest(text: str) -> str:
 
 
 def fingerprint(fn: ast.FunctionDef | ast.AsyncFunctionDef, path: str, qualname: str, formulas: bool = True) -> FunctionInfo:
-    exact, struct, toks = _serialize(fn, _local_names(fn))
+    exact, struct, toks, lits = _serialize(fn, _local_names(fn))
     return FunctionInfo(
         path=path,
         qualname=qualname,
@@ -155,6 +158,7 @@ def fingerprint(fn: ast.FunctionDef | ast.AsyncFunctionDef, path: str, qualname:
         n_tokens=len(toks),
         h_exact=_digest(" ".join(exact)),
         h_struct=_digest(" ".join(struct)),
+        h_lit=_digest(" ".join(lits)),
         tokens=toks,
         formulas=function_formulas(fn) if formulas else [],
         vocab=_vocab(fn),

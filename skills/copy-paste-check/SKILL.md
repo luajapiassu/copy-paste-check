@@ -17,6 +17,7 @@ O CLI `cpcheck` já prova a duplicata de forma determinística. Seu papel é só
 | Tipo | Significa | Ação padrão |
 |---|---|---|
 | `exact` / `struct` | mesma função, talvez com nomes trocados | importe a existente; não recrie |
+| `struct~` | mesma estrutura, valores diferentes (colunas, janelas, constantes) | parametrize a existente e chame-a; se forem coisas distintas, siga |
 | `formula` | mesma conta escrita de outro jeito | importe a existente; se a semântica divergir (ex.: unidade, base 252 × 365), explique isso num comentário |
 | `near` | parecida, com linhas diferentes | se a diferença for um parâmetro, generalize a existente; senão, siga |
 
@@ -31,4 +32,5 @@ Rode `cpcheck diff --base origin/main --markdown` e inclua a saída na revisão.
 ## Passo Haiku (só leitura)
 
 - Antes de escrever: `cpcheck ask "lista de dias úteis entre datas" "tirar acento"` devolve, por item, a função canônica e as ressalvas que mudam o resultado.
-- No PR ou depois do hook: `cpcheck judge` (sem arquivos = o diff contra `--base`). Exact/struct e near ≥ 0,95 são duplicata sem chamar modelo; o resto o Haiku julga e o veredito fica em `cpcheck-verdicts.json` (versionado). `coincidencia` e `intencional` não exigem ação; `duplicata` segue a tabela acima; `incerto` = Haiku indisponível, olhe a função apontada.
+- No PR: `cpcheck review --base origin/main`. Uma linha por função nova: `-> caminho:linha nome` (já existe: reutilize, olhando a ressalva) ou `-> NAO EXISTE`. `[execucao]` = mesmo resultado numérico, provado sem modelo; `[descartada]` = o modelo não respondeu ou respondeu fora das candidatas: confira à mão.
+- Para mover uma função para um módulo compartilhado, apague a original antes de escrever a nova (senão o hook bloqueia como cópia).

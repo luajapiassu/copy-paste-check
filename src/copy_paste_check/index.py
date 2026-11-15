@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import minhash
-from .config import Config
+from .config import Config, is_test_path
 from .extract import FunctionInfo, extract_functions
 
 DEFAULT_EXCLUDE = [
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha TEXT NOT NULL, stam
 CREATE TABLE IF NOT EXISTS functions (
     id INTEGER PRIMARY KEY, path TEXT NOT NULL, qualname TEXT NOT NULL,
     lineno INTEGER, end_lineno INTEGER, n_tokens INTEGER,
-    h_exact TEXT, h_struct TEXT, sig BLOB, shingles BLOB
+    h_exact TEXT, h_struct TEXT, h_lit TEXT, sig BLOB, shingles BLOB
 );
 CREATE TABLE IF NOT EXISTS sdf (h INTEGER PRIMARY KEY, n INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS formulas (canon TEXT NOT NULL, fn_id INTEGER NOT NULL, lineno INTEGER);
@@ -68,6 +68,8 @@ CREATE INDEX IF NOT EXISTS ix_band_fn ON bands(fn_id);
 """
 
 
+LOCK_WAIT = 5  # segundos esperando outro processo que está gravando no índice
+COMMIT_EVERY = 200  # scan morto no meio (timeout do hook) continua daqui, não do zero
 PARALLEL_MIN_FILES = 40  # abaixo disso o custo de subir processos (spawn no Windows) não compensa
 
 
@@ -86,7 +88,7 @@ def _analyze(job: tuple[str, str, int, bool, bool]):
 
 @dataclass(slots=True, frozen=True)
 class Match:
-    kind: str  # exact | struct | formula | near | vocab | execucao | execucao~
+    kind: str  # exact | struct | struct~ (mesma estrutura, literais diferentes) | formula | near | vocab | execucao | execucao~
     score: float
     path: str
     qualname: str
@@ -114,27 +116,31 @@ class Index:
         self.min_tokens = self.config.min_tokens
         db_dir = self.root / ".cpcheck"
         db_dir.mkdir(exist_ok=True)
+        if not (db_dir / ".gitignore").exists():  # ninguém precisa lembrar de ignorar o índice
+            (db_dir / ".gitignore").write_text("*\n")
         db_path = db_dir / "index.db"
         version = _fingerprint(self.config)
         if not db_path.exists():
             self._seed_from_worktree(db_path, version)
-        self.db = sqlite3.connect(db_path)
-        if self.db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] and _db_version(self.db) != version:
-            self.db.close()  # índice de outra versão do código/config: recria
-            for suffix in ("", "-wal", "-shm"):
-                Path(f"{db_path}{suffix}").unlink(missing_ok=True)
-            self.db = sqlite3.connect(db_path)
-        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db = sqlite3.connect(db_path, timeout=LOCK_WAIT)
+        if _db_version(self.db) != version:  # índice novo ou de outra versão do código/config: (re)cria
+            if self.db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
+                self.db.close()
+                for suffix in ("", "-wal", "-shm"):
+                    Path(f"{db_path}{suffix}").unlink(missing_ok=True)
+                self.db = sqlite3.connect(db_path, timeout=LOCK_WAIT)
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.executescript(SCHEMA)
+            try:  # FTS5 vem no sqlite do Python oficial; sem ele a busca por vocabulário só fica vazia
+                self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS vocab USING fts5("
+                                "path UNINDEXED, qualname UNINDEXED, lineno UNINDEXED, body)")
+            except sqlite3.OperationalError:
+                pass
+            self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('version', ?)", (version,))
+            self.db.commit()
+        # índice já na versão certa: abrir não escreve nada, então outro hook gravando não trava a consulta deste
         self.db.execute("PRAGMA synchronous=NORMAL")
-        self.db.executescript(SCHEMA)
-        try:  # FTS5 vem no sqlite do Python oficial; sem ele a busca por vocabulário só fica vazia
-            self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS vocab USING fts5("
-                            "path UNINDEXED, qualname UNINDEXED, lineno UNINDEXED, body)")
-            self.has_vocab = True
-        except sqlite3.OperationalError:
-            self.has_vocab = False
-        self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('version', ?)", (version,))
-        self.db.commit()
+        self.has_vocab = bool(self.db.execute("SELECT 1 FROM sqlite_master WHERE name='vocab'").fetchone())
 
     def _seed_from_worktree(self, db_path: Path, version: str) -> None:
         """Worktree nova: copia o índice de outra worktree do mesmo repo (se tiver a mesma config).
@@ -212,9 +218,9 @@ class Index:
                                 [(rel, q, ln, v) for q, ln, v in vocab])
         for f, sig, ids in funcs:
             cur = self.db.execute(
-                "INSERT INTO functions(path, qualname, lineno, end_lineno, n_tokens, h_exact, h_struct, sig, shingles)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                (rel, f.qualname, f.lineno, f.end_lineno, f.n_tokens, f.h_exact, f.h_struct,
+                "INSERT INTO functions(path, qualname, lineno, end_lineno, n_tokens, h_exact, h_struct, h_lit, sig, shingles)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (rel, f.qualname, f.lineno, f.end_lineno, f.n_tokens, f.h_exact, f.h_struct, f.h_lit,
                  minhash.to_bytes(sig) if sig else None, minhash.to_bytes(ids) if ids else None),
             )
             if ids:
@@ -248,16 +254,21 @@ class Index:
             if old_sha == sha:
                 self.db.execute("UPDATE files SET stamp=? WHERE path=?", (stamp, rel))
                 continue
-            self._delete(rel)
             todo.append((rel, sha, stamp, data.decode("utf-8", errors="replace")))
-        jobs = [(rel, src, self.min_tokens, self.config.formula, self.config.near) for rel, _, _, src in todo]
-        if len(jobs) >= PARALLEL_MIN_FILES:
-            with ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
-                analyzed = list(pool.map(_analyze, jobs, chunksize=8))
-        else:
-            analyzed = [_analyze(j) for j in jobs]
-        for (rel, sha, stamp, _), funcs in zip(todo, analyzed):
-            self._insert(rel, sha, stamp, funcs)
+        pool = (ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1))
+                if len(todo) >= PARALLEL_MIN_FILES else None)
+        try:
+            for i in range(0, len(todo), COMMIT_EVERY):
+                chunk = todo[i : i + COMMIT_EVERY]
+                jobs = [(rel, src, self.min_tokens, self.config.formula, self.config.near) for rel, _, _, src in chunk]
+                analyzed = list(pool.map(_analyze, jobs, chunksize=8)) if pool else [_analyze(j) for j in jobs]
+                for (rel, sha, stamp, _), funcs in zip(chunk, analyzed):
+                    self._delete(rel)
+                    self._insert(rel, sha, stamp, funcs)
+                self.db.commit()
+        finally:
+            if pool:
+                pool.shutdown()
         changed = len(todo)
         removed = [p for p in known if p not in seen]
         for rel in removed:
@@ -277,19 +288,19 @@ class Index:
             df.update(self.db.execute(f"SELECT h, n FROM sdf WHERE h IN ({','.join('?' * len(chunk))})", chunk))
         return {h: math.log(total / (df.get(h, 0) + 1)) + 1 for h in ids}
 
-    def by_vocab(self, f: FunctionInfo, k: int = 8) -> list[Match]:
+    def by_vocab(self, f: FunctionInfo, k: int = 8, terms: list[str] | None = None) -> list[Match]:
         """Funções que usam as mesmas palavras (BM25): acha mesma intenção com código diferente.
 
         Ignora arquivos de teste (helper de teste copiado aparece pelo ``query``) e a própria função.
         """
-        terms = sorted(set(f.vocab.split()))
+        terms = sorted(set(f.vocab.split() if terms is None else terms))  # ``terms``: busca só por eles
         if not self.has_vocab or not terms:
             return []
         rows = self.db.execute(
             "SELECT path, qualname, lineno, bm25(vocab) FROM vocab WHERE vocab MATCH ? ORDER BY bm25(vocab) LIMIT ?",
             (" OR ".join(f'"{w}"' for w in terms), k + 20)).fetchall()
         out = [Match("vocab", -score, p, q, ln) for p, q, ln, score in rows
-               if (p, q) != (f.path, f.qualname) and "test" not in p.rsplit("/", 1)[-1]]
+               if (p, q) != (f.path, f.qualname) and not is_test_path(p)]
         return out[:k]
 
     def query(self, f: FunctionInfo, limit: int = 3) -> list[Match]:
@@ -313,7 +324,11 @@ class Index:
                     found[key] = Match(kind, score, path, qual, line)
 
         add("exact", 1.0, self.db.execute("SELECT path, qualname, lineno FROM functions WHERE h_exact=?", (f.h_exact,)))
-        add("struct", 1.0, self.db.execute("SELECT path, qualname, lineno FROM functions WHERE h_struct=?", (f.h_struct,)))
+        same = self.db.execute("SELECT path, qualname, lineno, h_lit FROM functions WHERE h_struct=?",
+                               (f.h_struct,)).fetchall()
+        add("struct", 1.0, [r[:3] for r in same if r[3] == f.h_lit])
+        # mesma forma com colunas/janelas/constantes diferentes: candidata a parametrizar, não cópia provada
+        add("struct~", 1.0, [r[:3] for r in same if r[3] != f.h_lit])
         for canon, _ in (f.formulas if self.config.formula and self.config.formulas_enabled(f.path) else []):
             rows = self.db.execute(
                 "SELECT fn.path, fn.qualname, fo.lineno, fn.id FROM formulas fo JOIN functions fn ON fn.id=fo.fn_id"
@@ -346,5 +361,5 @@ class Index:
             for score, path, qual, line in sorted(near, reverse=True):
                 add("near", score, [(path, qual, line)])
 
-        order = {"exact": 0, "struct": 1, "formula": 2, "near": 3}
+        order = {"exact": 0, "struct": 1, "struct~": 2, "formula": 3, "near": 4}
         return sorted(found.values(), key=lambda m: (order[m.kind], -m.score))[:limit]

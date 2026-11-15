@@ -16,7 +16,7 @@ formula_max_funcs = 5
 # Duplicações intencionais: "glob do caminho::glob do nome da função".
 # Não são cobradas por serem cópia, mas continuam aparecendo como origem
 # a reutilizar quando alguém cria uma cópia nova em outro lugar.
-allow = ["shared/extratos/templates_*/*.py::_parse_br_number"]
+allow = ["templates/*/*.py::_parse_number"]
 
 # Onde não indexar fórmulas (testes repetem a conta do código testado).
 formula_exclude = ["tests/*", "*/tests/*", "test_*.py", "*/test_*.py", "*_test.py"]

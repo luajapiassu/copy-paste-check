@@ -7,7 +7,7 @@ dependencies = []
 
 [project.optional-dependencies]
 formula = ["sympy>=1.12"]
-dev = ["pytest>=8", "sympy>=1.12"]
+dev = ["pytest>=8", "sympy>=1.12", "numpy", "pandas"]
 
 [project.scripts]
 cpcheck = "copy_paste_check.cli:main"

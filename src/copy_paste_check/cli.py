@@ -1,4 +1,4 @@
-"""CLI ``cpcheck``: scan, check, diff e hook."""
+"""CLI ``cpcheck``: scan, check, diff, review, ask e hook."""
 
 from __future__ import annotations
 
@@ -72,21 +72,25 @@ def _git(root: Path, *args: str) -> str:
 def _changed_funcs(idx: Index, base: str, min_tokens: int | None = None):
     """Funções novas/alteradas da working tree (commits + não commitado + não rastreado) vs merge-base com ``base``."""
     for rel, before, after in _changed_sources(idx, base):
-        yield rel, hook.new_or_changed(before, after, rel, min_tokens or idx.min_tokens)
+        yield rel, hook.new_or_changed(before, after, rel, min_tokens or idx.min_tokens, idx.config.formula)
 
 
 def _changed_sources(idx: Index, base: str):
     """(arquivo, código no merge-base, código na working tree) de cada .py mexido."""
     mb = _git(idx.root, "merge-base", base, "HEAD").strip()
-    files = _git(idx.root, "diff", "--name-only", "--diff-filter=AMR", mb).splitlines()
-    files += _git(idx.root, "ls-files", "--others", "--exclude-standard").splitlines()
+    olds: dict[str, str] = {}  # caminho atual -> caminho no merge-base (arquivo renomeado não vira "tudo novo")
+    for line in _git(idx.root, "diff", "--name-status", "-M", "--diff-filter=AMR", mb).splitlines():
+        status, *paths = line.split("\t")
+        olds[paths[-1]] = paths[0]
+    for p in _git(idx.root, "ls-files", "--others", "--exclude-standard").splitlines():
+        olds.setdefault(p, p)
     skip = DEFAULT_EXCLUDE + idx.config.exclude  # migration, venv etc. também não contam no diff
-    for rel in dict.fromkeys(p for p in files if p.endswith(".py") and not any(fnmatch(p, s) for s in skip)):
+    for rel, old in olds.items():
         path = idx.root / rel
-        if not path.exists():
+        if not rel.endswith(".py") or any(fnmatch(rel, s) for s in skip) or not path.exists():
             continue
         try:
-            before = _git(idx.root, "show", f"{mb}:{rel}")
+            before = _git(idx.root, "show", f"{mb}:{old}")
         except subprocess.CalledProcessError:
             before = ""
         yield rel, before, path.read_text(encoding="utf-8", errors="replace")
@@ -114,28 +118,6 @@ def cmd_diff(a) -> int:
     return _report(results, a.json, a.fail_on)
 
 
-def _candidates(idx: Index, a) -> list:
-    """Funções a julgar: as dos arquivos pedidos ou, sem arquivos, as novas/alteradas vs --base."""
-    if not a.files:
-        return _query_all(idx, _changed_funcs(idx, a.base), a.limit)
-    rels = [idx.rel(f) for f in a.files]
-    changed = [(rel, extract_functions((idx.root / rel).read_text(encoding="utf-8", errors="replace"),
-                                       rel, idx.min_tokens, idx.config.formula))
-               for rel in rels if (idx.root / rel).exists()]
-    return _query_all(idx, changed, a.limit)
-
-
-def cmd_judge(a) -> int:
-    idx = _open(a.root)
-    idx.scan()
-    verdicts = judge_mod.judge(idx, _candidates(idx, a), low=a.low, high=a.high, remember=not a.no_remember)
-    idx.close()
-    for v in verdicts:
-        print(f"{v.path}:{v.lineno} {v.qualname} ~ {v.other.path}:{v.other.lineno} {v.other.qualname}"
-              f" {v.other.kind}={v.other.score:.2f} [{v.veredito}/{v.origem}] -> {v.canonica} | {v.diferencas}")
-    return 1 if a.fail_on == "strong" and any(v.veredito == "duplicata" for v in verdicts) else 0
-
-
 def cmd_ask(a) -> int:
     print(judge_mod.ask(Path(a.root) if a.root else find_root(Path.cwd()), a.items))
     return 0
@@ -145,7 +127,7 @@ def review_input(idx: Index, base: str):
     """Funções mexidas no PR e quais delas são novas (não existiam no merge-base)."""
     changed, novas = [], set()
     for rel, before, after in _changed_sources(idx, base):
-        funcs = hook.new_or_changed(before, after, rel, judge_mod.REVIEW_MIN_TOKENS)
+        funcs = hook.new_or_changed(before, after, rel, judge_mod.REVIEW_MIN_TOKENS, idx.config.formula)
         old = {f.qualname for f in extract_functions(before, rel, 1, False)}
         novas |= {(rel, f.qualname) for f in funcs if f.qualname not in old}
         changed.append((rel, funcs))
@@ -157,7 +139,9 @@ def cmd_review(a) -> int:
     idx = _open(a.root)
     idx.scan()
     changed, novas = review_input(idx, a.base)
-    found = judge_mod.review(idx, changed, execute=not a.no_exec, novas=novas)
+    runner = judge_mod.run_claude if a.no_cache else judge_mod.cached(idx, judge_mod.run_claude)
+    found = judge_mod.review(idx, changed, runner=runner, execute=not a.no_exec, novas=novas,
+                             expand=not a.no_expand)
     idx.close()
     for f in found:
         where = f"{f.canonica.path}:{f.canonica.lineno} {f.canonica.qualname}" if f.canonica else "NAO EXISTE"
@@ -167,6 +151,21 @@ def cmd_review(a) -> int:
         print(f"tokens: {total} (entrada {u['input']}, cache escrita {u['cache_write']}, cache leitura "
               f"{u['cache_read']}, saída {u['output']}) | {u['ms'] / 1000:.1f} s no modelo", file=sys.stderr)
     return 1 if a.fail_on == "found" and any(f.canonica for f in found) else 0
+
+
+def cmd_bench(a) -> int:
+    """Acerto do review contra um gabarito do próprio repositório (ver ``bench.py``)."""
+    from . import bench
+    idx = _open(a.root)
+    idx.scan()
+    rows = bench.run(idx, bench.load(Path(a.gabarito)), execute=not a.no_exec)
+    idx.close()
+    for r in rows:
+        print(f"{'ok  ' if r['ok'] else 'ERRO'} {r['nome']} -> {r['achou'] or 'NAO EXISTE'} [{r['origem']}]"
+              f" (esperado: {', '.join(r['espera']) or 'NAO EXISTE'}) {r['ressalva']}")
+    total = sum(u["input"] + u["cache_write"] + u["cache_read"] + u["output"] for u in judge_mod.USAGE)
+    print(f"acertos: {sum(r['ok'] for r in rows)}/{len(rows)} | {len(judge_mod.USAGE)} chamada(s), {total} tokens")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -191,16 +190,6 @@ def main(argv: list[str] | None = None) -> int:
         c.add_argument("--fail-on", choices=["strong", "any", "none"], default="strong")
         c.set_defaults(fn=fn)
 
-    j = sub.add_parser("judge", help="Haiku julga os candidatos ambíguos (near 0,70-0,85, formula); sem arquivos: o diff vs --base")
-    j.add_argument("files", nargs="*")
-    j.add_argument("--base", default="origin/main")
-    j.add_argument("--limit", type=int, default=3)
-    j.add_argument("--low", type=float, default=0.70)
-    j.add_argument("--high", type=float, default=0.95)
-    j.add_argument("--no-remember", action="store_true", help="não grava em cpcheck-verdicts.json")
-    j.add_argument("--fail-on", choices=["strong", "none"], default="none")
-    j.set_defaults(fn=cmd_judge)
-
     k = sub.add_parser("ask", help="busca prévia em linguagem natural (Haiku, só leitura)")
     k.add_argument("items", nargs="+", help="o que você vai precisar, ex.: 'lista de dias úteis entre datas'")
     k.set_defaults(fn=cmd_ask)
@@ -208,8 +197,16 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("review", help="PR: execução das contas + 1 chamada ao Haiku com candidatas locais (vs --base)")
     r.add_argument("--base", default="origin/main")
     r.add_argument("--no-exec", action="store_true", help="não executa as funções de conta puras")
+    r.add_argument("--no-expand", action="store_true",
+                   help="pula a chamada curta que pede termos de busca ao modelo (nome em outro idioma, sigla)")
+    r.add_argument("--no-cache", action="store_true", help="pergunta de novo ao modelo mesmo sem mudança no código")
     r.add_argument("--fail-on", choices=["found", "none"], default="none")
     r.set_defaults(fn=cmd_review)
+
+    b = sub.add_parser("bench", help="mede o review contra um gabarito .toml do seu repositório")
+    b.add_argument("gabarito")
+    b.add_argument("--no-exec", action="store_true")
+    b.set_defaults(fn=cmd_bench)
 
     h = sub.add_parser("hook", help="hook do Claude Code (lê JSON do stdin)")
     h.set_defaults(fn=lambda a: hook.run())

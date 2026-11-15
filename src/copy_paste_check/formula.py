@@ -118,6 +118,8 @@ class _Converter:
         )
         args = [self(a) for a in node.args]
         kw = {k.arg: k.value for k in node.keywords}
+        # kwargs mudam a conta (std(ddof=0) x std()): entram no nome da função opaca, que não é renomeado
+        opaque = sp.Function(fname + "".join(f"[{k}={ast.unparse(v)}]" for k, v in sorted(kw.items()) if k))
         if is_method:
             obj = self(func.value)
             self.weight += 1
@@ -132,7 +134,7 @@ class _Converter:
             if fname in _MATH and not args:
                 return getattr(sp, _MATH[fname])(obj)
             if fname in _OPAQUE:
-                return sp.Function(fname)(obj, *args)
+                return opaque(obj, *args)
             raise _NotFormula
         self.weight += 1
         if fname == "log1p" and len(args) == 1:
@@ -142,7 +144,7 @@ class _Converter:
         if fname in _MATH and len(args) == 1:
             return getattr(sp, _MATH[fname])(args[0])
         if fname in _OPAQUE and args:
-            return sp.Function(fname)(*args)
+            return opaque(*args)
         raise _NotFormula
 
 

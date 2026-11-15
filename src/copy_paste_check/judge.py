@@ -1,40 +1,31 @@
-"""Passo Haiku (somente leitura): julga os candidatos que o determinístico não decide sozinho.
+"""Passo Haiku (somente leitura): decide o que o determinístico não decide sozinho.
 
-- ``exact``/``struct`` e ``near`` acima de ``judge_high``: duplicata, sem chamar modelo.
-- ``near`` entre ``judge_low`` e ``judge_high`` e ``formula``: o Haiku lê as duas funções e dá o veredito.
+- ``review``: uma chamada sem ferramentas por PR, com cada função nova e as candidatas achadas localmente
+  (pares do índice, busca por vocabulário e "quase igual" da execução).
 - ``ask``: busca prévia em linguagem natural; o Haiku usa só Grep/Glob/Read.
-
-Vereditos ficam em ``cpcheck-verdicts.json`` na raiz (versionado), chaveados pelo par de ``h_exact``:
-mudou o código de qualquer lado, a chave muda e o par é julgado de novo.
 """
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
 import os
 import re
 import subprocess
 import tempfile
+import textwrap
 from dataclasses import dataclass
-from datetime import date
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
-from .extract import FunctionInfo, extract_functions
+from .config import is_test_path
+from .extract import FunctionInfo, _words, extract_functions
 from .index import Index, Match
 
-VERDICTS_FILE = "cpcheck-verdicts.json"
 MODEL = "haiku"
-VEREDITOS = ("duplicata", "coincidencia", "intencional")
 
-JUDGE_SYSTEM = (
-    "Você compara duas funções Python de um mesmo repositório e decide se a segunda é uma duplicata "
-    "da primeira (alguém deveria importar uma em vez de manter as duas). Responda SÓ um JSON: "
-    '{"veredito": "duplicata" | "coincidencia" | "intencional", "canonica": "caminho:linha da que deve ser usada", '
-    '"diferencas": "o que muda o resultado (ddof, feriados, preço x retorno, NaN/índice, unidade); uma frase"}. '
-    "coincidencia = só parecem (mesmo esqueleto, intenção diferente); intencional = cópia deliberada "
-    "(arquivo autocontido, template). Seja conservador: na dúvida entre duplicata e coincidencia, diga coincidencia."
-)
 ASK_SYSTEM = (
     "Você procura, num repositório Python, funções que já fazem o que o usuário vai precisar escrever. "
     "Use Grep com termo específico (sem varrer pastas), olhe shared/ primeiro, abra só candidatas (~20 linhas). "
@@ -67,6 +58,8 @@ def run_claude(prompt: str, system: str, tools: str | None, cwd: Path | None) ->
     if out.returncode != 0:
         raise RuntimeError(out.stderr.strip() or f"claude saiu com {out.returncode}")
     data = json.loads(out.stdout)
+    if data.get("is_error"):  # limite de uso etc. vem com exit 0: não é resposta do modelo
+        raise RuntimeError(str(data.get("result") or "claude devolveu erro"))
     u = data.get("usage", {})
     USAGE.append({"model": next(iter(data.get("modelUsage", {})), "?"), "input": u.get("input_tokens", 0),
                   "cache_write": u.get("cache_creation_input_tokens", 0), "cache_read": u.get("cache_read_input_tokens", 0),
@@ -75,92 +68,42 @@ def run_claude(prompt: str, system: str, tools: str | None, cwd: Path | None) ->
     return data.get("result", "")
 
 
-@dataclass(slots=True)
-class Verdict:
-    path: str
-    qualname: str
-    lineno: int
-    other: Match
-    veredito: str
-    canonica: str = ""
-    diferencas: str = ""
-    origem: str = "regra"  # regra | haiku | memoria
+def cached(idx: Index, runner: Runner = run_claude) -> Runner:
+    """Mesma pergunta (modelo + sistema + prompt) não paga duas vezes: rodar o review de novo sem mudar nada é grátis.
+
+    ponytail: guarda na tabela ``meta`` do índice local, sem expiração; some quando o índice é recriado.
+    """
+    def run(prompt: str, system: str, tools: str | None, cwd: Path | None) -> str:
+        raw = f"{os.environ.get('CPCHECK_MODEL', MODEL)}\0{system}\0{prompt}".encode()
+        key = "llm:" + hashlib.blake2b(raw, digest_size=16).hexdigest()
+        row = idx.db.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+        if row:
+            return row[0]
+        text = runner(prompt, system, tools, cwd)
+        if text.strip():
+            idx.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", (key, text))
+            idx.db.commit()
+        return text
+    return run
+
+
+@lru_cache(maxsize=256)
+def _parsed(file: str, stamp: int) -> tuple[list[str], dict[str, FunctionInfo]]:
+    """Um parse por arquivo por rodada (``stamp`` invalida se o arquivo mudar); antes era um por candidata."""
+    source = Path(file).read_text(encoding="utf-8", errors="replace")
+    funcs: dict[str, FunctionInfo] = {}
+    for f in extract_functions(source, file, 1, False):
+        funcs.setdefault(f.qualname, f)
+    return source.splitlines(), funcs
 
 
 def _find(root: Path, path: str, qualname: str) -> tuple[FunctionInfo, str] | None:
     file = root / path
     if not file.exists():
         return None
-    source = file.read_text(encoding="utf-8", errors="replace")
-    for f in extract_functions(source, path, 1, False):
-        if f.qualname == qualname:
-            return f, "\n".join(source.splitlines()[f.lineno - 1 : f.end_lineno])
-    return None
-
-
-def _key(a: FunctionInfo, b: FunctionInfo) -> str:
-    return ":".join(sorted([a.h_exact, b.h_exact]))  # exato: trocar um literal (ddof 1→0) refaz o veredito
-
-
-def load_memory(root: Path) -> dict:
-    p = root / VERDICTS_FILE
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-
-
-def save_memory(root: Path, mem: dict) -> None:
-    text = json.dumps(mem, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    (root / VERDICTS_FILE).write_text(text, encoding="utf-8")
-
-
-def parse_verdict(text: str) -> dict:
-    m = re.search(r"\{.*\}", text, re.S)
-    data = json.loads(m.group(0)) if m else {}
-    if data.get("veredito") not in VEREDITOS:
-        raise ValueError(f"resposta sem veredito válido: {text[:200]!r}")
-    return data
-
-
-def judge(idx: Index, results: list[tuple[str, str, int, list[Match]]], runner: Runner = run_claude,
-          low: float = 0.70, high: float = 0.95, remember: bool = True) -> list[Verdict]:
-    """``results`` vem de ``check``/``diff``: (path, função, linha, matches)."""
-    mem = load_memory(idx.root)
-    out: list[Verdict] = []
-    dirty = False
-    for path, qual, line, matches in results:
-        mine = _find(idx.root, path, qual)
-        for m in matches:
-            if m.kind in ("exact", "struct") or (m.kind == "near" and m.score >= high):
-                out.append(Verdict(path, qual, line, m, "duplicata", f"{m.path}:{m.lineno}", origem="regra"))
-                continue
-            if m.kind == "near" and m.score < low:
-                continue
-            theirs = _find(idx.root, m.path, m.qualname)
-            if not mine or not theirs:
-                continue
-            key = _key(mine[0], theirs[0])
-            if key in mem:
-                v = mem[key]
-                out.append(Verdict(path, qual, line, m, v["veredito"], v.get("canonica", ""),
-                                   v.get("diferencas", ""), "memoria"))
-                continue
-            prompt = (f"Função A (a canônica candidata) — {m.path}:{m.lineno} {m.qualname}\n```python\n{theirs[1]}\n```\n\n"
-                      f"Função B (a nova) — {path}:{line} {qual}\n```python\n{mine[1]}\n```\n\n"
-                      f"O detector marcou {m.kind} (nota {m.score:.2f}).")
-            try:
-                data = parse_verdict(runner(prompt, JUDGE_SYSTEM, None, None))
-            except (RuntimeError, ValueError, subprocess.SubprocessError, OSError) as e:  # JSONDecodeError é ValueError
-                out.append(Verdict(path, qual, line, m, "incerto", diferencas=f"Haiku indisponível: {e}", origem="haiku"))
-                continue
-            out.append(Verdict(path, qual, line, m, data["veredito"], data.get("canonica", ""),
-                               data.get("diferencas", ""), "haiku"))
-            if remember:
-                mem[key] = {"veredito": data["veredito"], "canonica": data.get("canonica", ""),
-                            "diferencas": data.get("diferencas", ""), "a": f"{m.path}::{m.qualname}",
-                            "b": f"{path}::{qual}", "data": date.today().isoformat()}
-                dirty = True
-    if dirty:
-        save_memory(idx.root, mem)
-    return out
+    lines, funcs = _parsed(str(file), file.stat().st_mtime_ns)
+    f = funcs.get(qualname)
+    return (f, "\n".join(lines[f.lineno - 1 : f.end_lineno])) if f else None
 
 
 def ask(root: Path, wanted: list[str], runner: Runner = run_claude) -> str:
@@ -173,16 +116,23 @@ def ask(root: Path, wanted: list[str], runner: Runner = run_claude) -> str:
 
 REVIEW_SYSTEM = (
     "Você recebe funções NOVAS de um PR e, para cada uma, funções que JÁ EXISTEM no repositório (candidatas "
-    "achadas por similaridade de código e de vocabulário). Para cada nova, diga se alguma candidata faz a MESMA "
-    "coisa (mesma entrada, mesma saída, mesmo efeito). Mesmo esqueleto (CRUD, endpoint, delete+404) sobre "
-    "entidades diferentes NÃO é a mesma coisa. USAR só quando a candidata substitui a nova (trocar uma pela outra "
-    "dá o mesmo resultado, ressalvas pequenas). Se só parece, ou é a mais próxima mas faz outra coisa, a resposta é "
-    "NAO EXISTE e a mais próxima vai na ressalva. A própria função nova nunca é resposta. Saída: uma linha por "
-    "item, exatamente: '<n> -> USAR arq:linha nome - ressalva' ou '<n> -> NAO EXISTE - ressalva' (até 20 "
-    "palavras, só diferenças que mudam o resultado). Responda direto, sem preâmbulo."
+    "achadas por similaridade de código, de vocabulário e de resultado). Para cada nova, decida se alguma candidata "
+    "RESPONDE À MESMA PERGUNTA: quem fosse chamar a nova poderia chamar a existente e obter a mesma informação. "
+    "Continua sendo a mesma (responda USAR e ponha a diferença na ressalva) quando só muda: tratamento de erro, de "
+    "None ou de entrada vazia; fallback; nome, ordem ou um parâmetro a mais; tipo equivalente do retorno; o jeito "
+    "de escrever a conta; de onde vem um dado auxiliar (ex.: a lista de feriados). "
+    "É outra coisa (responda NAO EXISTE e cite a mais próxima na ressalva) quando, para a mesma entrada, o número "
+    "ou o efeito é outro: outra regra, outra unidade ou outro produto (dias corridos x dias úteis, semanal x "
+    "diário, renda fixa x fundo), outra operação sobre o mesmo dado (ler x gravar, criar x apagar, listar x "
+    "buscar um), outra entidade ou tabela, ou só o mesmo esqueleto (CRUD, endpoint, delete+404) sobre coisas "
+    "diferentes. A própria função nova nunca é resposta. Saída: uma linha por item, exatamente: "
+    "'<n> -> USAR arq:linha nome - ressalva' ou '<n> -> NAO EXISTE - ressalva' (até 20 palavras). A linha começa "
+    "pelo veredito final; não escreva USAR se a conclusão for que é outra coisa. Responda direto, sem preâmbulo."
 )
 REVIEW_LINES = 12  # linhas de cada candidata no prompt; com 6 o Haiku errou 4/9 (2026-11-12)
-REVIEW_MIN_TOKENS = 20  # ponytail: abaixo disso é getter/one-liner; baixar se escapar one-liner duplicado
+# ponytail: abaixo disso é getter/one-liner. Medido: "tirar acento" = 30 tokens, dia útil com feriados = 20,
+# `d.weekday() < 5` = 11 (escapa). Baixar para 10 se escapar one-liner duplicado.
+REVIEW_MIN_TOKENS = 20
 
 
 @dataclass(slots=True)
@@ -192,7 +142,7 @@ class Finding:
     lineno: int
     canonica: Match | None
     ressalva: str = ""
-    origem: str = "haiku"  # haiku | execucao | execucao~ | descartada
+    origem: str = "haiku"  # haiku | execucao | descartada
 
 
 def _is_test(qualname: str) -> bool:
@@ -223,6 +173,23 @@ def _pick(choice: str, cands: list[Match]) -> Match | None:
     return next((c for c in hits if c.path in norm), hits[0] if len(hits) == 1 else None)
 
 
+def _excerpt(src: str, n: int) -> str:
+    """Primeiras ``n`` linhas com a docstring reduzida à primeira frase (docstring longa comia o código)."""
+    lines = src.splitlines()
+    try:
+        fn = ast.parse(textwrap.dedent(src)).body[0]
+        doc = ast.get_docstring(fn)
+    except (SyntaxError, IndexError, TypeError):
+        doc = None
+    if doc:
+        node = fn.body[0]
+        indent = re.match(r"\s*", lines[node.lineno - 1]).group()
+        lines[node.lineno - 1 : node.end_lineno] = [f'{indent}"""{doc.strip().splitlines()[0]}"""']
+    if len(lines) > n:  # o return fica no fim: cortar só o começo escondia a conta
+        lines = lines[: n - 3] + ["    ..."] + lines[-2:]
+    return "\n".join(lines)
+
+
 def _ask_items(idx: Index, asks: list, runner: Runner) -> dict[int, tuple[str, str]]:
     parts = [f"São {len(asks)} itens: responda TODOS, de 1 a {len(asks)}, uma linha cada."]
     for i, (rel, f, cands) in enumerate(asks, 1):
@@ -230,11 +197,37 @@ def _ask_items(idx: Index, asks: list, runner: Runner) -> dict[int, tuple[str, s
         blocks = []
         for c in cands:
             got = _find(idx.root, c.path, c.qualname)
-            body = "\n".join(got[1].splitlines()[:REVIEW_LINES]) if got else ""
-            blocks.append(f"- {c.path}:{c.lineno} {c.qualname}\n```python\n{body}\n```")
+            hint = " (resultado numérico quase igual: até 5% de diferença)" if c.kind == "execucao~" else ""
+            blocks.append(f"- {c.path}:{c.lineno} {c.qualname}{hint}\n```python\n"
+                          f"{_excerpt(got[1], REVIEW_LINES) if got else ''}\n```")
         parts.append(f"## {i}. NOVA: {f.qualname}\n```python\n{(mine[1] if mine else '')[:1500]}\n```\n"
                      "Candidatas existentes:\n" + "\n".join(blocks))
     return _parse_review(runner("\n\n".join(parts), REVIEW_SYSTEM, None, None))
+
+
+EXPAND_SYSTEM = (
+    "Você recebe funções NOVAS de um PR. Para cada uma, liste até 8 termos de busca (palavras soltas, minúsculas) "
+    "que apareceriam no NOME ou na docstring de uma função equivalente que já exista no repositório: o nome "
+    "técnico da conta ou operação em inglês e em português, siglas consagradas e sinônimos. Não repita os nomes "
+    "de variável da própria função. Saída: uma linha por item, exatamente: '<n>: termo, termo, termo'. Sem preâmbulo."
+)
+
+
+def _expand(idx: Index, items: list, runner: Runner) -> dict[int, list[str]]:
+    """Termos de busca dados pelo modelo: ligam nome em português a nome/sigla em inglês (e vice-versa).
+
+    A busca por vocabulário só casa palavra igual; aqui o modelo só sugere onde procurar, e o que ele
+    sugerir ainda tem de existir no índice e passar pelo julgamento. Falhou: segue sem os termos.
+    """
+    parts = []
+    for i, (rel, f) in enumerate(items, 1):
+        mine = _find(idx.root, rel, f.qualname)
+        parts.append(f"## {i}. {f.qualname}\n```python\n{(mine[1] if mine else '')[:800]}\n```")
+    try:
+        text = runner("\n\n".join(parts), EXPAND_SYSTEM, None, None)
+    except (RuntimeError, ValueError, subprocess.SubprocessError, OSError):
+        return {}
+    return {int(m.group(1)): _words(m.group(2))[:8] for m in re.finditer(r"^\W*(\d+)\W+(.+)$", text, re.M)}
 
 
 def _sem_acento(s: str) -> str:
@@ -242,44 +235,56 @@ def _sem_acento(s: str) -> str:
 
 
 def review(idx: Index, changed, runner: Runner = run_claude, k: int = 8, execute: bool = True,
-           novas: set[tuple[str, str]] | None = None) -> list[Finding]:
+           novas: set[tuple[str, str]] | None = None, expand: bool = False) -> list[Finding]:
     """``changed``: [(path, [FunctionInfo novas/alteradas])]. Uma chamada ao Haiku, sem ferramentas.
 
     Teste (``test_*``) fica de fora; helper de teste entra. Item que a execução já decidiu não vai ao modelo.
     Busca por vocabulário só para função **nova** (``novas``; None = todas) fora de arquivo de teste: duplicata
     de função alterada já existia antes do PR, então ela só vai ao modelo se o índice achar par.
+    ``expand``: uma chamada curta antes pede termos de busca ao modelo (nome em outro idioma, sigla).
     """
     items = [(rel, f) for rel, funcs in changed for f in funcs
              if not _is_test(f.qualname) and f.n_tokens >= REVIEW_MIN_TOKENS]
     pr = {(rel, f.qualname) for rel, funcs in changed for f in funcs}
     out: list[Finding] = []
+    quase: dict[tuple[str, str], list[Match]] = {}
     if execute and items:
         from . import execfp  # import tardio: só quem executa paga
         news = {rel: (idx.root / rel).read_text(encoding="utf-8", errors="replace") for rel in {r for r, _ in items}}
-        paths = [p for (p,) in idx.db.execute("SELECT path FROM files") if "test" not in p.rsplit("/", 1)[-1]]
+        paths = [p for (p,) in idx.db.execute("SELECT path FROM files") if not is_test_path(p)]
         by_exec = execfp.matches(idx.root, paths, news)
         rest = []
         for rel, f in items:
-            ms = by_exec.get((rel, f.qualname))
-            if ms:
+            ms = by_exec.get((rel, f.qualname)) or []
+            if ms and ms[0].kind == "execucao":
                 out.append(Finding(rel, f.qualname, f.lineno, ms[0], f"mesmo resultado em {int(ms[0].score)} entradas",
-                                   ms[0].kind))
-            else:
+                                   "execucao"))
+            else:  # "quase igual" (até 5%) é pista, não prova: vai ao modelo como candidata
+                quase[(rel, f.qualname)] = ms
                 rest.append((rel, f))
         items = rest
+    def is_new(rel: str, f: FunctionInfo) -> bool:
+        return (novas is None or (rel, f.qualname) in novas) and not is_test_path(rel)
+
+    to_expand = [(rel, f) for rel, f in items if is_new(rel, f)] if expand else []
+    termos = _expand(idx, to_expand, runner) if to_expand else {}
+    termos = {(rel, f.qualname): termos.get(i, []) for i, (rel, f) in enumerate(to_expand, 1)}
     asks = []
     for rel, f in items:
         seen, cands = set(), []
-        nova = (novas is None or (rel, f.qualname) in novas) and "test" not in rel.rsplit("/", 1)[-1]
+        nova = is_new(rel, f)
         # o índice já tem a working tree: outra função do próprio PR não é "candidata existente" no vocabulário
         # (confundia o Haiku); cópia entre duas novas continua vindo pelo query (exact/near)
         vocab = [m for m in idx.by_vocab(f, k + len(pr)) if (m.path, m.qualname) not in pr] if nova else []
-        for m in idx.query(f, limit=3) + vocab:
+        extra = termos.get((rel, f.qualname))
+        sugeridas = [m for m in idx.by_vocab(f, 4 + len(pr), extra) if (m.path, m.qualname) not in pr][:4] if extra else []
+        for m in quase.get((rel, f.qualname), []) + idx.query(f, limit=3) + sugeridas + vocab:
             if (m.path, m.qualname) not in seen and (m.path, m.qualname) != (rel, f.qualname):
                 seen.add((m.path, m.qualname))
                 cands.append(m)
-        if cands[:k]:
-            asks.append((rel, f, cands[:k]))
+        cands = cands[: k + len(sugeridas)]  # as sugeridas pelos termos do modelo entram a mais, não no lugar
+        if cands:
+            asks.append((rel, f, cands))
     if not asks:
         return out
     try:
@@ -293,10 +298,13 @@ def review(idx: Index, changed, runner: Runner = run_claude, k: int = 8, execute
                       for rel, f, _ in asks]
     for i, (rel, f, cands) in enumerate(asks, 1):
         choice, why = answers.get(i, ("", "sem resposta"))
-        if "NAO EXISTE" in _sem_acento(choice) or "NAO EXISTE" in _sem_acento(why):  # inclui "corrijo: NÃO EXISTE"
+        # na ressalva só vale o veredito em maiúsculas ("corrijo: NAO EXISTE"); "o parâmetro não existe" é prosa
+        if "NAO EXISTE" in _sem_acento(choice) or re.search(r"N[AÃ]O EXISTE", why):
             out.append(Finding(rel, f.qualname, f.lineno, None, why, "haiku"))
             continue
-        pick = _pick(choice, cands)
+        # candidata listada em outro item da mesma chamada também vale: existe e o modelo viu o código dela
+        pick = _pick(choice, cands) or _pick(choice, [c for _, _, cs in asks for c in cs
+                                                      if (c.path, c.qualname) != (rel, f.qualname)])
         if not pick and re.search(rf"\b{re.escape(f.qualname.rsplit('.', 1)[-1])}\b", choice):
             out.append(Finding(rel, f.qualname, f.lineno, None, "apontou a própria função", "haiku"))
             continue
