@@ -6,14 +6,14 @@ Princípio: **o máximo determinístico, LLM só para o que não dá para decidi
 
 ## Como detecta
 
-**Padrão leve:** só `exact` e `struct` (biblioteca padrão, ~0,2 s por checagem). `formula` e `near` são opcionais: ligue com `formula = true` / `near = true` no `.cpcheck.toml` (`formula` exige `pip install ".[formula]"`). Trocar essas opções recria o índice sozinho.
+**Padrão:** `exact`, `struct` e `near` (só biblioteca padrão). `formula` é opcional: ligue com `formula = true` no `.cpcheck.toml` (exige `pip install ".[formula]"`). `near = false` desliga o `near`. Trocar essas opções recria o índice sozinho.
 
 Cada função vira um conjunto de impressões digitais, calculadas a partir da AST (não de regex):
 
 | Tipo | Técnica | Pega |
 |---|---|---|
 | `exact` | hash do corpo (ignora nome, docstring e comentários) | cópia idêntica |
-| `struct` | hash da AST com variáveis locais renomeadas (`v0`, `v1`…) e literais trocados pelo tipo | cópia com nomes ou valores trocados |
+| `struct` | hash da AST com variáveis locais renomeadas (`v0`, `v1`…) e literais trocados pelo tipo | cópia com nomes trocados. Mesma forma com **valores diferentes** (colunas, janelas, 252 × 365) sai como `struct~`: só avisa, é candidata a parametrizar |
 | `formula` | toda expressão aritmética da função (não só o `return`), simplificada com sympy e invariante a nomes e ordem de variáveis | `(a - b) / b` = `a / b - 1`; `log(a) - log(b)` = `log(a / b)`; `df["close"] / df["close"].shift() - 1` = `precos.close.pct_change()` |
 | `near` | MinHash+LSH acha candidatos; a nota é o Jaccard dos shingles ponderado por raridade no repo (boilerplate pesa pouco) | cópia com algumas linhas alteradas (Jaccard ponderado por raridade ≥ 0,75) |
 
@@ -36,22 +36,29 @@ cpcheck scan                         # cria/atualiza o índice
 cpcheck check shared/calc.py         # checa um arquivo contra o resto do repo
 cpcheck diff --base origin/main      # só o que mudou no PR
 cpcheck diff --base origin/main --markdown   # saída pronta para comentário de PR
+cpcheck ask "lista de dias úteis entre datas"   # busca prévia em linguagem natural (Haiku, só leitura)
+cpcheck bench gabarito.toml          # mede o review contra um gabarito do seu repositório
 ```
 
 `--fail-on strong|any|none` controla o exit code (padrão: `strong`, ou seja, falha só em `exact`/`struct`).
 
 `cpcheck review --base origin/main` é a passada completa de PR (working tree vs merge-base):
 
-1. **Execução** (sem LLM): funções de conta puras (só `np`/`pd`/`math`) rodam num subprocesso isolado com o Python do projeto em entradas fixas; mesmo resultado = mesma conta (`execucao`), até 5% = mesma conta com outro parâmetro, ex. `ddof` (`execucao~`).
-2. **Candidatas locais** (sem LLM): pares do índice + busca por vocabulário (FTS5/BM25: nome, docstring, o que a função usa, constantes como 252). Vocabulário só para função **nova** fora de teste; função alterada só vai adiante se o índice achar par.
-3. **Uma chamada ao Haiku, sem ferramentas**, com cada função e até 8 candidatas (12 linhas cada); resposta fora das candidatas é descartada. No wright-apps (7 funções): ~14 mil tokens, ~12 s. Pensamento limitado por `CPCHECK_THINKING` (padrão 2048).
+1. **Execução** (sem LLM): funções de conta puras (só `np`/`pd`/`math`) rodam num subprocesso isolado com o Python do projeto em entradas fixas; mesmo resultado = mesma conta (`execucao`), até 5% (`execucao~`, ex. `ddof`) é pista e vai ao Haiku como candidata. Se a etapa não rodar (Python do projeto sem numpy/pandas, timeout), avisa no stderr. Em worktree usa a `.venv` do checkout principal.
+2. **Candidatas locais**: pares do índice + busca por vocabulário (FTS5/BM25: nome, docstring, o que a função usa, constantes como 252). Vocabulário só para função **nova** fora de teste; função alterada só vai adiante se o índice achar par.
+   A busca só casa palavra igual, então antes dela uma chamada curta ao Haiku (~2,5 mil tokens) pede termos de busca para cada função nova: o nome técnico em inglês e português e siglas. É o que liga `_multiplo_do_capital` a `moic`. `--no-expand` pula.
+3. **Uma chamada de julgamento ao Haiku, sem ferramentas**, com cada função e suas candidatas (12 linhas cada, sempre com o final da função); resposta que não aponta uma candidata mostrada é descartada. Num repositório real (7 funções novas): ~14 mil tokens, ~12 s. Pensamento limitado por `CPCHECK_THINKING` (padrão 2048). Rodar de novo sem mudar o código não gasta tokens (resposta guardada no índice local; `--no-cache` pergunta de novo).
 
 ### Hook do Claude Code
 
 Veja [`examples/claude-settings.json`](examples/claude-settings.json). O mesmo comando atende dois eventos:
 
 - **PreToolUse** (Write/Edit/MultiEdit em `.py`): **bloqueia** só quando há evidência forte (`exact`/`struct`) e diz qual função reutilizar.
-- **PostToolUse**: **avisa** sem bloquear sobre `formula` e `near`.
+- **PostToolUse**: **avisa** sem bloquear sobre `struct~`, `formula` e `near`.
+
+Renomear uma função não bloqueia (a versão antiga do próprio arquivo não conta). Para **mover**, apague a original antes de escrever a nova.
+
+Rode `cpcheck scan` uma vez ao instalar: o primeiro scan pode passar do timeout do hook (se for interrompido, o próximo continua de onde parou). A pasta `.cpcheck/` se ignora sozinha no git.
 
 Só são checadas funções **novas ou alteradas** pela edição. `CPCHECK_MODE=warn` desliga o bloqueio.
 
@@ -69,4 +76,4 @@ Testado em sessão real do Claude Code (`claude -p`): o bloqueio impede a escrit
 
 ## Roadmap
 
-Ver [`ROADMAP.md`](ROADMAP.md) — inclui a frente de **duplicidade de dados no Postgres** (reaproveitamento via PK/FK).
+Ver [`ROADMAP.md`](ROADMAP.md).

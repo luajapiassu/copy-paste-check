@@ -282,13 +282,13 @@ def test_config_from_pyproject(tmp_path: Path):
     assert cfg.min_tokens == 10 and cfg.exclude == ["pocs/*"]
 
 
-def test_formula_and_near_off_by_default(repo: Path):
-    """Padrão leve: só exact/struct; sem sympy e sem MinHash no índice."""
+def test_padrao_near_ligado_e_formula_desligada(repo: Path):
+    """Padrão: exact/struct + near (cópia com linhas alteradas); formula (sympy) é opcional."""
     idx = Index(repo)
     idx.scan()
-    assert not idx.config.formula and not idx.config.near
+    assert not idx.config.formula and idx.config.near
     assert idx.db.execute("SELECT count(*) FROM formulas").fetchone()[0] == 0
-    assert idx.db.execute("SELECT count(*) FROM bands").fetchone()[0] == 0
+    assert idx.db.execute("SELECT count(*) FROM bands").fetchone()[0] > 0
     idx.close()
 
 
@@ -414,3 +414,174 @@ def test_parallel_scan_matches_serial(repo, tmp_path_factory, monkeypatch):
     (other / "shared" / "calc.py").write_text(ORIGINAL)
     monkeypatch.setattr(index_mod, "PARALLEL_MIN_FILES", 1)
     assert dump(other) == serial and serial
+
+
+# ---- gaps achados na avaliação de 2026-11-14 ----------------------------------
+
+FORMA = '''
+def {n}(df, col):
+    out = df[df[col] > {a}].copy()
+    out["{c1}"] = out[col].rolling({w}).mean() * {k}
+    out["{c2}"] = out["{c1}"].fillna({a})
+    out = out.sort_values("{c1}").reset_index(drop=True)
+    return out[["{c1}", "{c2}"]]
+'''
+
+
+def _pre(tool: str, **inp) -> dict | None:
+    return run_hook({"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp})
+
+
+def test_hook_nao_bloqueia_renomear_funcao(repo: Path):
+    """A versão antiga ainda está no índice na hora do PreToolUse: não é duplicata, é a própria função."""
+    target = repo / "shared" / "calc.py"
+    assert _pre("Edit", file_path=str(target), old_string="def media_ponderada(", new_string="def wavg(") is None
+
+
+def test_hook_mover_funcao_bloqueia_mas_diz_como(repo: Path):
+    out = _pre("Write", file_path=str(repo / "novo.py"), content=ORIGINAL)
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "movendo" in reason and len(reason) < 500
+
+
+def test_struct_com_literais_diferentes_avisa_em_vez_de_bloquear(repo: Path):
+    (repo / "a.py").write_text(FORMA.format(n="vol", a=0, c1="vol", c2="vol_f", w=21, k=252))
+    outra = FORMA.format(n="liquidez", a=100, c1="liq", c2="liq_f", w=63, k=365)
+    assert _pre("Write", file_path=str(repo / "b.py"), content=outra) is None
+    (repo / "b.py").write_text(outra)
+    out = run_hook({"hook_event_name": "PostToolUse", "tool_name": "Write",
+                    "tool_input": {"file_path": str(repo / "b.py"), "content": outra}})
+    assert "struct~" in out["hookSpecificOutput"]["additionalContext"]
+    # mesmos literais, só nomes trocados: continua bloqueando
+    copia = FORMA.format(n="vol2", a=0, c1="vol", c2="vol_f", w=21, k=252).replace("out", "res")
+    assert _pre("Write", file_path=str(repo / "c.py"), content=copia)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_vocabulario_separa_camel_case():
+    from copy_paste_check.extract import _words
+    assert _words("annualizedVol AnbimaCalendar") == ["annualized", "vol", "anbima", "calendar"]
+
+
+def test_arquivo_de_teste_e_pelo_padrao_nao_por_conter_test():
+    from copy_paste_check.config import is_test_path
+    assert not is_test_path("shared/quant_tools/backtest.py") and not is_test_path("apps/latest.py")
+    assert all(is_test_path(p) for p in ("tests/unit/helpers.py", "apps/api/tests/test_x.py", "test_a.py",
+                                         "a/b_test.py", "conftest.py"))
+
+
+def test_vocab_acha_canonica_em_backtest_py(repo: Path):
+    (repo / "backtest.py").write_text('def vol_anual(retornos):\n    """volatilidade anualizada"""\n'
+                                      '    return retornos.std() * 252 ** 0.5\n')
+    idx = Index(repo)
+    idx.scan()
+    nova = fn('def volatilidade(retornos):\n    """volatilidade anualizada"""\n    return retornos.std(ddof=0) * 252 ** 0.5\n',
+              "volatilidade")
+    assert "vol_anual" in [m.qualname for m in idx.by_vocab(nova)]
+    idx.close()
+
+
+def test_scan_interrompido_guarda_o_que_ja_fez(repo: Path, monkeypatch):
+    """Hook com timeout mata o primeiro scan: o próximo continua de onde parou, não do zero."""
+    from copy_paste_check import index as index_mod
+    for i in range(5):
+        (repo / f"m{i}.py").write_text(ORIGINAL.replace("media_ponderada", f"f{i}"))
+    monkeypatch.setattr(index_mod, "COMMIT_EVERY", 2)
+    real, seen = index_mod._analyze, []
+
+    def morre_no_quinto(job):
+        seen.append(job[0])
+        if len(seen) == 5:
+            raise KeyboardInterrupt
+        return real(job)
+
+    monkeypatch.setattr(index_mod, "_analyze", morre_no_quinto)
+    idx = Index(repo)
+    with pytest.raises(KeyboardInterrupt):
+        idx.scan()
+    idx.close()
+    monkeypatch.setattr(index_mod, "_analyze", real)
+    idx = Index(repo)
+    assert idx.db.execute("SELECT count(*) FROM files").fetchone()[0] == 4
+    assert idx.scan()[0] == 2  # só os que faltavam
+    idx.close()
+
+
+def test_config_avisa_chave_desconhecida(repo: Path, capsys):
+    (repo / ".cpcheck.toml").write_text("near_treshold = 0.9\n")
+    Config.load(repo)
+    assert "near_treshold" in capsys.readouterr().err
+
+
+def test_pasta_do_indice_se_ignora_sozinha(repo: Path):
+    Index(repo).close()
+    assert (repo / ".cpcheck" / ".gitignore").read_text().strip() == "*"
+
+
+def test_formula_kwargs_mudam_a_conta():
+    """std(ddof=0) e std() dão resultados diferentes: não podem ter a mesma forma canônica."""
+    a = canon("def r(x):\n    return x.std(ddof=0) * 252 ** 0.5\n")
+    b = canon("def r(x):\n    return x.std() * 252 ** 0.5\n")
+    c = canon("def r(y):\n    return y.std(ddof=0) * 252 ** 0.5\n")
+    assert a and a != b and a == c
+
+
+def test_diff_nao_calcula_formula_com_formula_desligada(repo: Path, monkeypatch, capsys):
+    from copy_paste_check import extract
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                                    check=True, capture_output=True)
+    (repo / ".git").rmdir()
+    git("init", "-q", "-b", "main")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    (repo / "novo.py").write_text(ORIGINAL.replace("media_ponderada", "wavg"))
+    monkeypatch.setattr(extract, "function_formulas", lambda fn: 1 / 0)
+    assert main(["--root", str(repo), "diff", "--base", "main"]) == 1
+    capsys.readouterr()
+
+
+def test_arquivo_renomeado_nao_vira_funcao_nova(repo: Path):
+    from copy_paste_check.cli import review_input
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                                    check=True, capture_output=True)
+    (repo / ".git").rmdir()
+    git("init", "-q", "-b", "main")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    git("mv", "shared/calc.py", "shared/contas.py")
+    (repo / "shared" / "contas.py").write_text(ORIGINAL.replace("return None", "return None if pesos else 0"))
+    idx = Index(repo)
+    idx.scan()
+    changed, novas = review_input(idx, "main")
+    idx.close()
+    assert novas == set()
+    assert [f.qualname for _, funcs in changed for f in funcs] == ["media_ponderada"]
+
+
+def test_post_write_usa_o_antes_que_o_claude_code_manda(repo: Path):
+    """Reescrever arquivo existente sem mexer na função não repete o aviso (tool_response.originalFile é o antes)."""
+    (repo / ".cpcheck.toml").write_text("formula = true\n")
+    new = repo / "novo.py"
+    velho = "def variacao(a, b):\n    return a / b - 1\n"
+    new.write_text(velho + "\n\nX = 1\n")
+    payload = {"hook_event_name": "PostToolUse", "tool_name": "Write",
+               "tool_input": {"file_path": str(new), "content": new.read_text()}}
+    assert run_hook({**payload, "tool_response": {"originalFile": velho}}) is None
+    assert run_hook({**payload, "tool_response": {"originalFile": None}}) is not None  # arquivo novo: avisa
+
+
+def test_hook_checa_mesmo_com_indice_travado_por_outro_hook(repo: Path, monkeypatch):
+    """Dois hooks no mesmo checkout: o segundo não consegue gravar, mas consulta o índice que já existe."""
+    import sqlite3
+    from copy_paste_check import index as index_mod
+    idx = Index(repo)
+    idx.scan()
+    idx.close()
+    monkeypatch.setattr(index_mod, "LOCK_WAIT", 0.2)
+    outro = sqlite3.connect(repo / ".cpcheck" / "index.db")
+    outro.execute("BEGIN IMMEDIATE")
+    try:
+        out = _pre("Write", file_path=str(repo / "novo.py"), content=ORIGINAL.replace("media_ponderada", "wavg"))
+    finally:
+        outro.rollback()
+        outro.close()
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
