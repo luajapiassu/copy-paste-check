@@ -5,30 +5,38 @@ Exemplo::
     exclude = ["pocs/*", "scripts/_backfill_*.py"]
     min_tokens = 40
     formula = false   # true liga a camada de fórmulas (sympy)
-    near = false      # true liga o MinHash (cópias aproximadas)
+    near = true       # MinHash (cópias com algumas linhas alteradas); false desliga
     near_threshold = 0.75
     formula_max_funcs = 5
     # Duplicações intencionais: "glob do caminho::glob do nome da função".
     # Essas funções não são cobradas por serem cópia, mas continuam aparecendo
     # como origem a reutilizar quando alguém cria uma cópia nova em outro lugar.
-    allow = ["shared/extratos/templates_*/*.py::_parse_br_number"]
+    allow = ["templates/*/*.py::_parse_number"]
 """
 
 from __future__ import annotations
 
 import fnmatch
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def is_test_path(path: str) -> bool:
+    """Arquivo de teste pelo padrão do pytest (``backtest.py`` e ``latest.py`` não são teste)."""
+    *dirs, name = path.split("/")
+    return name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py" or "tests" in dirs
 
 
 @dataclass(slots=True)
 class Config:
     exclude: list[str] = field(default_factory=list)
     min_tokens: int = 40
-    # Camadas caras, desligadas por padrão: exact/struct são sempre ligadas.
     formula: bool = False  # exige sympy (pip install ".[formula]")
-    near: bool = False
+    # Ligado por padrão: custa ~2 s a mais no primeiro scan e ~1 ms por função consultada (medido em ~850
+    # arquivos) e só avisa, nunca bloqueia. É a camada que pega cópia com linhas alteradas.
+    near: bool = True
     near_threshold: float = 0.75
     # Fórmula que aparece em mais funções que isso é idioma, não duplicata.
     formula_max_funcs: int = 5
@@ -61,5 +69,7 @@ class Config:
                 data = data.get("tool", {}).get("cpcheck", {})
             except tomllib.TOMLDecodeError:
                 data = {}
-        known = {k: data[k] for k in ("exclude", "min_tokens", "formula", "near", "near_threshold", "formula_max_funcs", "allow", "formula_exclude") if k in data}
-        return cls(**known)
+        unknown = sorted(set(data) - set(cls.__dataclass_fields__))
+        if unknown:  # erro de digitação (near_treshold) não pode passar calado
+            print(f"cpcheck: chave desconhecida na configuração, ignorada: {', '.join(unknown)}", file=sys.stderr)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})

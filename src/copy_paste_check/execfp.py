@@ -26,7 +26,10 @@ SAFE_BUILTINS = {"abs", "all", "any", "bool", "dict", "enumerate", "filter", "fl
 SAFE_MODULES = {"np", "pd", "math", "numpy", "pandas"}
 BAD_ATTRS = {"read_csv", "read_excel", "read_sql", "to_csv", "to_excel", "to_sql", "read_parquet", "to_parquet",
              "read_json", "to_json", "read_pickle", "to_pickle", "load", "save", "savetxt", "loadtxt", "tofile",
-             "fromfile", "system", "memmap"}
+             "fromfile", "system", "memmap", "genfromtxt", "fromregex", "DataSource"}
+# pandas grava com to_*: só estes to_* são conversão em memória
+SAFE_TO = {"to_numpy", "to_list", "to_frame", "to_series", "to_dict", "to_period", "to_timestamp", "to_datetime",
+           "to_numeric", "to_timedelta", "to_pydatetime", "to_records", "to_flat_index"}
 MATH_ATTRS = {"std", "mean", "pct_change", "cumprod", "var", "sqrt", "log", "diff", "prod", "busday_count"}
 NEAR = 0.05  # ponytail: tolerância fixa; ddof em janela de ~15 retornos dá ~3%
 
@@ -43,11 +46,14 @@ def pure(node: ast.AST) -> bool:
     local |= {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
     for n in ast.walk(node):
         if isinstance(n, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal, ast.Await, ast.Yield, ast.YieldFrom,
-                          ast.AsyncFunctionDef, ast.ClassDef)):
+                          ast.AsyncFunctionDef, ast.ClassDef, ast.While)):
+            # ponytail: While fora porque um laço sem fim derruba o lote inteiro (um timeout só);
+            # `for` em range gigante ainda passa. Se acontecer, um subprocesso por função.
             return False
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in local | SAFE_BUILTINS | SAFE_MODULES:
             return False
-        if isinstance(n, ast.Attribute) and (n.attr in BAD_ATTRS or n.attr.startswith("_")):
+        if isinstance(n, ast.Attribute) and (n.attr in BAD_ATTRS or n.attr.startswith(("_", "read_", "save", "load"))
+                                             or (n.attr.startswith("to_") and n.attr not in SAFE_TO)):
             return False
     return any(isinstance(n, ast.BinOp) or (isinstance(n, ast.Attribute) and n.attr in MATH_ATTRS)
                for n in ast.walk(node))
@@ -59,7 +65,8 @@ import numpy as np, pandas as pd
 rng = np.random.default_rng(0)
 P = pd.Series(100 * np.cumprod(1 + rng.normal(0.0004, 0.01, 300)), index=pd.bdate_range("2023-01-02", periods=300))
 R = P.pct_change().dropna()
-FIRST = {"P": P, "R": R, "Pa": P.to_numpy(), "Rl": R.tolist(), "x": 0.05}
+R2 = pd.Series(rng.normal(0.0002, 0.02, 250), index=pd.bdate_range("2022-01-03", periods=250))
+FIRST = {"P": P, "R": R, "R2": R2, "Ra": R.to_numpy(), "Pa": P.to_numpy(), "Rl": R.tolist(), "x": 0.05}
 REST = {"None": None, "21": 21, "252": 252, "x": 0.05, "P": P, "R": R}
 
 def canon(v):
@@ -67,10 +74,14 @@ def canon(v):
         return None
     if isinstance(v, (int, float, np.integer, np.floating)):
         v = float(v)
-        return round(v, 9) if math.isfinite(v) else None
+        return [round(v, 9)] if math.isfinite(v) else None
     if isinstance(v, (pd.Series, np.ndarray, list)):
         a = np.asarray(pd.Series(v, dtype="float64").dropna())
-        return round(float(a.sum()), 7) if a.size else None
+        if not a.size:
+            return None
+        # tamanho + soma + soma ponderada pela posição: só a soma confundia zscore com demean (ambas 0)
+        # e sort(x) com x
+        return [float(a.size), round(float(a.sum()), 7), round(float(a @ np.arange(1, a.size + 1)) / a.size, 7)]
     return None
 
 out = {}
@@ -100,10 +111,19 @@ print(json.dumps(out))
 
 
 def find_python(root: Path) -> str:
-    """Python do projeto analisado (tem numpy/pandas); senão o atual."""
-    for p in (root / ".venv" / "Scripts" / "python.exe", root / ".venv" / "bin" / "python"):
-        if p.exists():
-            return str(p)
+    """Python do projeto analisado (tem numpy/pandas): ``.venv`` da raiz ou, em worktree, a do checkout principal."""
+    bases = [root]
+    try:
+        common = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=5).stdout.strip()
+        if common:
+            bases.append(Path(common).parent)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for base in bases:
+        for p in (base / ".venv" / "Scripts" / "python.exe", base / ".venv" / "bin" / "python"):
+            if p.exists():
+                return str(p)
     return sys.executable
 
 
@@ -124,14 +144,20 @@ def _pure_funcs(rel: str, source: str) -> list[tuple[str, str, int, int, int]]:
     return out
 
 
-def _run(funcs: list, python: str) -> dict[str, dict[str, float]]:
+def _run(funcs: list, python: str) -> dict[str, dict[str, list[float]]]:
+    """Etapa que não roda avisa no stderr: "não checou" não pode parecer "checou e não achou"."""
     with tempfile.TemporaryDirectory() as empty:
         try:
             res = subprocess.run([python, "-I", "-c", RUNNER], input=json.dumps(funcs), capture_output=True,
                                  encoding="utf-8", errors="replace", timeout=120, cwd=empty)
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"cpcheck: execução pulada ({type(e).__name__}: {e})", file=sys.stderr)
             return {}
-    return json.loads(res.stdout) if res.returncode == 0 and res.stdout.strip() else {}  # sem numpy/pandas: nada
+    if res.returncode != 0 or not res.stdout.strip():
+        why = (res.stderr.strip().splitlines() or ["sem saída"])[-1]
+        print(f"cpcheck: execução pulada ({python} sem numpy/pandas?): {why}", file=sys.stderr)
+        return {}
+    return json.loads(res.stdout)
 
 
 def matches(root: Path, paths: list[str], new: dict[str, str], python: str | None = None,
@@ -153,8 +179,10 @@ def matches(root: Path, paths: list[str], new: dict[str, str], python: str | Non
             common = [k for k in fps[key] if k in fp]
             if len(common) < 2:
                 continue
-            a = [fps[key][k] for k in common]
-            b = [fp[k] for k in common]
+            if any(len(fps[key][k]) != len(fp[k]) for k in common):  # escalar x série: não é a mesma conta
+                continue
+            a = [x for k in common for x in fps[key][k]]
+            b = [x for k in common for x in fp[k]]
             if all(abs(x - y) <= 1e-7 * max(1.0, abs(x)) for x, y in zip(a, b)):
                 kind = "execucao"
             elif all(abs(x - y) <= NEAR * max(1e-12, abs(x)) for x, y in zip(a, b)):
