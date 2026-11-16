@@ -76,7 +76,7 @@ cpcheck scan                         # cria/atualiza o índice
 cpcheck check shared/calc.py         # checa um arquivo contra o resto do repo
 cpcheck diff --base origin/main      # só o que mudou no PR
 cpcheck diff --base origin/main --markdown   # saída pronta para comentário de PR
-cpcheck ask "lista de dias úteis entre datas"   # busca prévia em linguagem natural (Haiku, só leitura)
+cpcheck ask "dias úteis entre datas"   # busca prévia por palavras no índice (sem modelo, zero tokens)
 cpcheck bench gabarito.toml          # mede o review contra um gabarito do seu repositório
 ```
 
@@ -84,10 +84,10 @@ cpcheck bench gabarito.toml          # mede o review contra um gabarito do seu r
 
 `cpcheck review --base origin/main` é a passada completa de PR (working tree vs merge-base):
 
-1. **Execução** (sem LLM): funções de conta puras (só `np`/`pd`/`math`) rodam num subprocesso isolado com o Python do projeto em entradas fixas; mesmo resultado = mesma conta (`execucao`), até 5% (`execucao~`, ex. `ddof`) é pista e vai ao Haiku como candidata. Se a etapa não rodar (Python do projeto sem numpy/pandas, timeout), avisa no stderr. Em worktree usa a `.venv` do checkout principal.
+1. **Execução** (sem LLM): funções puras de conta e de texto (só `np`/`pd`/`math`/`re`/`unicodedata`) rodam num subprocesso isolado com o Python do projeto em entradas fixas (séries, números, datas, textos como e-mail e CNPJ, e um DataFrame com as colunas que a função cita); mesmo resultado = mesma função (`execucao`). Até 5% de diferença (ex. `ddof`), ou igual só onde as duas respondem (uma devolve vazio e a outra não), é pista (`execucao~`) e vai ao Haiku como candidata. Se a etapa não rodar (Python do projeto sem numpy/pandas, timeout), avisa no stderr. Em worktree usa a `.venv` do checkout principal.
 2. **Candidatas locais**: pares do índice + busca por vocabulário (FTS5/BM25: nome, docstring, o que a função usa, constantes como 252). Vocabulário só para função **nova** fora de teste; função alterada só vai adiante se o índice achar par.
    A busca só casa palavra igual, então antes dela uma chamada curta ao Haiku (~2,5 mil tokens) pede termos de busca para cada função nova: o nome técnico em inglês e português e siglas. É o que liga `_multiplo_do_capital` a `moic`. `--no-expand` pula.
-3. **Uma chamada de julgamento ao Haiku, sem ferramentas**, com cada função e suas candidatas (12 linhas cada, sempre com o final da função); resposta que não aponta uma candidata mostrada é descartada. Num repositório real (7 funções novas): ~14 mil tokens, ~12 s. Pensamento limitado por `CPCHECK_THINKING` (padrão 2048). Rodar de novo sem mudar o código não gasta tokens (resposta guardada no índice local; `--no-cache` pergunta de novo).
+3. **Uma chamada de julgamento ao Haiku, sem ferramentas**, com cada função e suas candidatas (12 linhas cada, sempre com o final da função); resposta que não aponta uma candidata mostrada é descartada. Num repositório real (7 funções novas): ~14 mil tokens, ~12 s. Pensamento limitado por `CPCHECK_THINKING` (padrão 8000). Rodar de novo sem mudar o código não gasta tokens (resposta guardada no índice local; `--no-cache` pergunta de novo).
 
 ### Hook do Claude Code
 

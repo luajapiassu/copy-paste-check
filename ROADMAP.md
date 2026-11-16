@@ -12,7 +12,10 @@ Regra geral: **tudo que dá para provar com regra é determinístico; o LLM só 
 - [x] Worktree nova herda o índice de outra worktree do mesmo repo; scan em paralelo a partir de 40 arquivos
 - [x] Conjunto rotulado de regressão para o `near` (`tests/labeled_near.py`)
 - [x] `cpcheck review`: execução das contas puras + busca por vocabulário (FTS5), com termos de busca sugeridos pelo modelo numa chamada curta (liga nome em português a nome/sigla em inglês) + **uma** chamada de julgamento ao Haiku sem ferramentas; respostas guardadas no índice local
-- [x] `cpcheck ask`: busca prévia em linguagem natural (Haiku com Grep/Glob/Read)
+- [x] `cpcheck ask`: busca prévia por palavras no índice, sem modelo (`--llm` mantém a busca agêntica com o Haiku)
+- [x] Execução também de funções de texto, números, datas e DataFrame: num repositório real a cobertura foi de 21 para 108 das 147 funções puras e achou "só dígitos do CNPJ" em 8 arquivos e "normalizar e-mail" em 3
+- [x] Review checa função a partir de 10 tokens (antes 20: one-liner como `d.weekday() < 5` escapava)
+- [x] Teste ao vivo do isolamento do CLI (`CPCHECK_LIVE=1 pytest -k isolada`): falha se a chamada mínima passar de 5 mil tokens
 - [x] `cpcheck bench`: mede o `review` contra um gabarito do próprio repositório (o gabarito não mora aqui)
 - [x] CI do próprio repo (pytest em Linux e Windows)
 
@@ -33,14 +36,17 @@ Medido em um repositório Python real (~850 arquivos, ~6.700 funções):
   - Mais entradas de retornos na execução (conta que só dá número com negativos tinha uma entrada só).
   - Aceitar candidata mostrada em outro item da mesma chamada.
 
+- Segundo repositório (gabarito de 11 casos, nunca usado para ajustar o prompt): 5/11 na primeira rodada. O modelo respondia "NAO EXISTE - a mais próxima faz o mesmo". Três ajustes levaram a 9–11/11 sem piorar o primeiro (18–20/20): dizer no prompt que sem diferença apontável o veredito é USAR; ler correção feita no meio da resposta; teto de pensamento de 2048 para 8000 (mesmo total de tokens).
+- O julgamento **oscila entre rodadas**: 1 ou 2 casos de fronteira mudam de lado com o mesmo código. Os termos de busca sugeridos pelo modelo também variam, e uma candidata pode não aparecer numa rodada.
+- `ask` sem modelo, 9 pedidos em português: a função certa veio entre as 4 primeiras em 6. Erra quando o pedido está em português e o nome em inglês ("é dia útil" x `_is_business_day`).
+
 ## Pendente
 
-- [ ] Gabarito maior e de mais de um repositório: 20 casos de um repo só, escritos junto com o ajuste do prompt, medem pouco. Par que escapar em PR real vira caso novo.
-- [ ] `REVIEW_MIN_TOKENS = 20`: função de uma linha muito curta (`d.weekday() < 5`, 11 tokens) não é checada. Baixar aumenta os itens por chamada; decidir com o gabarito.
-- [ ] `ask` sem LLM: a busca por vocabulário já responde "o que existe com essas palavras" sem tokens; medir contra o `ask` agêntico antes de trocar.
-- [ ] Execução: só parte das funções puras aceita as entradas fixas (as que recebem DataFrame, colunas ou datas ficam de fora).
-- [ ] `near` em pares curtos com cláusula extra fica abaixo do ruído (xfail em `tests/labeled_near.py`).
-- [ ] Teste que falhe se uma chamada mínima ao CLI passar de ~5 mil tokens (pega mudança de versão do CLI que quebre o isolamento).
+- [ ] Oscilação do julgamento: medir cada gabarito em 5 rodadas e testar lotes menores ou segunda opinião só nos itens `NAO EXISTE` com candidata forte.
+- [ ] Gabarito ainda pequeno (20 + 11 casos, dois repositórios do mesmo time). Par que escapar em PR real vira caso novo.
+- [ ] `ask`: não cruza português e inglês (o `review` cruza com uma chamada curta ao modelo; o `ask` não, para custar zero).
+- [ ] Execução: 39 das 147 funções puras do repositório de teste ainda não rodam (pedem dicionário, lista de registros ou objeto do projeto).
+- [ ] `near` em pares curtos com cláusula extra fica abaixo do ruído (xfail em `tests/labeled_near.py`); hoje quem pega esse caso é o `review`.
 - [ ] TS/TSX: hoje só Python.
 - [ ] Distribuição: biblioteca fixada por tag ou plugin do Claude Code.
 

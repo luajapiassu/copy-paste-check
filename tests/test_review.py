@@ -1,4 +1,5 @@
 """Chamada única (busca local + Haiku sem ferramentas) e impressão digital por execução."""
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -433,3 +434,35 @@ def test_resposta_que_aponta_candidata_de_outro_item_vale(idx):
     trocado = judge.review(idx, changed, runner=lambda *a: "1 -> USAR shared/calc.py:13 salvar_cliente - x\n2 -> NAO EXISTE - y",
                            execute=False, k=1)
     assert [(f.qualname, f.canonica.qualname) for f in trocado if f.canonica] == [("_vol_anual", "salvar_cliente")]
+
+
+def test_ask_local_sem_modelo(tmp_path, capsys, monkeypatch):
+    """`cpcheck ask` responde pelo vocabulário do índice, sem chamar o modelo."""
+    from copy_paste_check import cli
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "calc.py").write_text('def vol_anualizada(retornos):\n    """Volatilidade anualizada."""\n'
+                                      "    return retornos.std() * 252 ** 0.5\n", encoding="utf-8")
+    monkeypatch.setattr(judge, "run_claude", lambda *a: pytest.fail("não era para chamar o modelo"))
+    assert cli.main(["--root", str(tmp_path), "ask", "volatilidade dos retornos", "enviar e-mail"]) == 0
+    out = capsys.readouterr().out
+    assert "calc.py:1 vol_anualizada" in out and "enviar e-mail: nada" in out
+
+
+@pytest.mark.skipif(not os.environ.get("CPCHECK_LIVE"), reason="chama o Claude de verdade: CPCHECK_LIVE=1")
+def test_chamada_minima_fica_isolada():
+    """Se uma versão nova do CLI voltar a carregar MCPs/settings, a chamada mínima passa de ~1 mil para ~100 mil tokens."""
+    judge.USAGE.clear()
+    judge.run_claude("Responda só: ok", "Responda só: ok", None, None)
+    u = judge.USAGE[-1]
+    assert u["input"] + u["cache_write"] + u["cache_read"] < 5000, u
+
+
+def test_parse_review_correcao_no_meio_do_texto():
+    """O modelo às vezes pensa alto: vale o último veredito de cada item, mesmo no meio de uma frase."""
+    text = ("7 -> NAO EXISTE - pondera por PL\n\nCorreção do item 7: é a mesma informação. Logo: 7 -> USAR a/b.py:86\n\n"
+            "8 -> USAR a/b.py:86 make - não; ver abaixo.\n\nCorreção do item 8: divide. Veredito: 8 -> NAO EXISTE - multiplica")
+    got = judge._parse_review(text)
+    assert got[7][0] == "USAR a/b.py:86" and "EXISTE" in got[8][0]
+    from copy_paste_check.index import Match
+    cands = [Match("vocab", 1.0, "a/b.py", "make", 86), Match("vocab", 1.0, "a/c.py", "outra", 3)]
+    assert judge._pick(got[7][0], cands).qualname == "make"
