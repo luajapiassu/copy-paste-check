@@ -31,6 +31,6 @@ Rode `cpcheck diff --base origin/main --markdown` e inclua a saída na revisão.
 
 ## Passo Haiku (só leitura)
 
-- Antes de escrever: `cpcheck ask "lista de dias úteis entre datas" "tirar acento"` devolve, por item, a função canônica e as ressalvas que mudam o resultado.
-- No PR: `cpcheck review --base origin/main`. Uma linha por função nova: `-> caminho:linha nome` (já existe: reutilize, olhando a ressalva) ou `-> NAO EXISTE`. `[execucao]` = mesmo resultado numérico, provado sem modelo; `[descartada]` = o modelo não respondeu ou respondeu fora das candidatas: confira à mão.
+- Antes de escrever: `cpcheck ask "dias úteis entre datas" "tirar acento"` lista, por item, as funções do repositório com essas palavras no nome, na docstring ou no corpo (sem modelo, zero tokens). A busca casa palavra igual: se não achar, repita com o termo em inglês ou a sigla (`business days`, `moic`). Abra a candidata antes de reutilizar.
+- No PR: `cpcheck review --base origin/main`. Uma linha por função nova: `-> caminho:linha nome` (já existe: reutilize, olhando a ressalva) ou `-> NAO EXISTE`. `[execucao]` = mesmo resultado nas entradas de teste (conta ou texto), provado sem modelo; `[descartada]` = o modelo não respondeu ou respondeu fora das candidatas: confira à mão.
 - Para mover uma função para um módulo compartilhado, apague a original antes de escrever a nova (senão o hook bloqueia como cópia).

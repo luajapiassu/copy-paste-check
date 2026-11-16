@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import hook
 from . import judge as judge_mod
-from .extract import extract_functions
+from .extract import _words, extract_functions
 from .index import DEFAULT_EXCLUDE, Index, find_root
 
 
@@ -119,7 +119,18 @@ def cmd_diff(a) -> int:
 
 
 def cmd_ask(a) -> int:
-    print(judge_mod.ask(Path(a.root) if a.root else find_root(Path.cwd()), a.items))
+    """Busca prévia. Padrão: palavras do pedido contra o vocabulário do índice, sem modelo (zero tokens)."""
+    if a.llm:
+        print(judge_mod.ask(Path(a.root) if a.root else find_root(Path.cwd()), a.items))
+        return 0
+    idx = _open(a.root)
+    idx.scan()
+    for item in a.items:
+        found = idx.search(_words(item), a.limit)
+        print(f"{item}:" + ("" if found else " nada com essas palavras (tente o termo em inglês ou a sigla)"))
+        for m in found:
+            print(f"  {m.path}:{m.lineno} {m.qualname}")
+    idx.close()
     return 0
 
 
@@ -190,8 +201,10 @@ def main(argv: list[str] | None = None) -> int:
         c.add_argument("--fail-on", choices=["strong", "any", "none"], default="strong")
         c.set_defaults(fn=fn)
 
-    k = sub.add_parser("ask", help="busca prévia em linguagem natural (Haiku, só leitura)")
-    k.add_argument("items", nargs="+", help="o que você vai precisar, ex.: 'lista de dias úteis entre datas'")
+    k = sub.add_parser("ask", help="busca prévia por palavras no índice (sem modelo); --llm usa o Haiku com Grep")
+    k.add_argument("items", nargs="+", help="o que você vai precisar, ex.: 'dias úteis entre datas business days'")
+    k.add_argument("--limit", type=int, default=5)
+    k.add_argument("--llm", action="store_true", help="busca agêntica com o Haiku (~30 mil tokens por item)")
     k.set_defaults(fn=cmd_ask)
 
     r = sub.add_parser("review", help="PR: execução das contas + 1 chamada ao Haiku com candidatas locais (vs --base)")

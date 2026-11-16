@@ -293,15 +293,19 @@ class Index:
 
         Ignora arquivos de teste (helper de teste copiado aparece pelo ``query``) e a própria função.
         """
-        terms = sorted(set(f.vocab.split() if terms is None else terms))  # ``terms``: busca só por eles
+        # ``terms``: busca só por eles
+        return self.search(f.vocab.split() if terms is None else terms, k, (f.path, f.qualname))
+
+    def search(self, terms: list[str], k: int = 8, skip: tuple[str, str] | None = None) -> list[Match]:
+        """Busca por palavras soltas no vocabulário das funções (sem modelo, zero tokens)."""
+        terms = sorted(set(terms))
         if not self.has_vocab or not terms:
             return []
         rows = self.db.execute(
             "SELECT path, qualname, lineno, bm25(vocab) FROM vocab WHERE vocab MATCH ? ORDER BY bm25(vocab) LIMIT ?",
             (" OR ".join(f'"{w}"' for w in terms), k + 20)).fetchall()
-        out = [Match("vocab", -score, p, q, ln) for p, q, ln, score in rows
-               if (p, q) != (f.path, f.qualname) and not is_test_path(p)]
-        return out[:k]
+        return [Match("vocab", -score, p, q, ln) for p, q, ln, score in rows
+                if (p, q) != skip and not is_test_path(p)][:k]
 
     def query(self, f: FunctionInfo, limit: int = 3) -> list[Match]:
         """Procura duplicatas de ``f`` no índice, ignorando a própria função.

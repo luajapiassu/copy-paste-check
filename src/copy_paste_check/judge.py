@@ -2,7 +2,7 @@
 
 - ``review``: uma chamada sem ferramentas por PR, com cada função nova e as candidatas achadas localmente
   (pares do índice, busca por vocabulário e "quase igual" da execução).
-- ``ask``: busca prévia em linguagem natural; o Haiku usa só Grep/Glob/Read.
+- ``ask --llm``: busca prévia agêntica; o Haiku usa só Grep/Glob/Read (o ``ask`` padrão não chama modelo).
 """
 
 from __future__ import annotations
@@ -50,9 +50,10 @@ def run_claude(prompt: str, system: str, tools: str | None, cwd: Path | None) ->
         cmd += ["--allowed-tools", tools]
     # sem ferramentas o cwd não importa: roda num diretório vazio para não carregar o CLAUDE.md do projeto
     with tempfile.TemporaryDirectory() as empty:
-        # pensamento limitado: sem ele o Haiku aponta a própria função e erra ressalva; sem teto, 5-7 mil
-        # tokens de saída e ~30 s (medido em 2026-11-12, cpc/sim_vocab.py)
-        env = {**os.environ, "MAX_THINKING_TOKENS": os.environ.get("CPCHECK_THINKING", "2048")}
+        # sem pensamento o Haiku aponta a própria função e erra ressalva. Teto de 2048 fazia o modelo raciocinar
+        # na resposta e se contradizer ("NAO EXISTE - a mais próxima faz o mesmo"): em 2 gabaritos, 7-11/11 e
+        # 17/20 com 2048 contra 9-11/11 e 18-20/20 com 8000, com o mesmo total de tokens (2026-11-16)
+        env = {**os.environ, "MAX_THINKING_TOKENS": os.environ.get("CPCHECK_THINKING", "8000")}
         out = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=300,
                              cwd=cwd if tools else empty, encoding="utf-8", env=env)
     if out.returncode != 0:
@@ -126,13 +127,16 @@ REVIEW_SYSTEM = (
     "diário, renda fixa x fundo), outra operação sobre o mesmo dado (ler x gravar, criar x apagar, listar x "
     "buscar um), outra entidade ou tabela, ou só o mesmo esqueleto (CRUD, endpoint, delete+404) sobre coisas "
     "diferentes. A própria função nova nunca é resposta. Saída: uma linha por item, exatamente: "
-    "'<n> -> USAR arq:linha nome - ressalva' ou '<n> -> NAO EXISTE - ressalva' (até 20 palavras). A linha começa "
-    "pelo veredito final; não escreva USAR se a conclusão for que é outra coisa. Responda direto, sem preâmbulo."
+    "'<n> -> USAR arq:linha nome - ressalva' ou '<n> -> NAO EXISTE - o que a mais próxima faz de diferente' (até 20 "
+    "palavras). Decida assim: ache a candidata mais próxima e diga que diferença ela tem no resultado ou no efeito; "
+    "se a diferença é das que não contam, ou se não há diferença (você escreveria 'faz o mesmo', 'idêntica', 'mesma "
+    "regra'), o veredito é USAR. A linha começa pelo veredito final; não escreva USAR se a conclusão for que é "
+    "outra coisa, nem NAO EXISTE se a mais próxima faz a mesma coisa. Responda direto, sem preâmbulo."
 )
 REVIEW_LINES = 12  # linhas de cada candidata no prompt; com 6 o Haiku errou 4/9 (2026-11-12)
-# ponytail: abaixo disso é getter/one-liner. Medido: "tirar acento" = 30 tokens, dia útil com feriados = 20,
-# `d.weekday() < 5` = 11 (escapa). Baixar para 10 se escapar one-liner duplicado.
-REVIEW_MIN_TOKENS = 20
+# ponytail: abaixo disso é getter. Medido: "tirar acento" = 30 tokens, dia útil com feriados = 20,
+# `d.weekday() < 5` = 11. Com 10 entram ~8% mais funções (268 de 3.175 num repositório real).
+REVIEW_MIN_TOKENS = 10
 
 
 @dataclass(slots=True)
@@ -156,7 +160,10 @@ def _parse_review(text: str) -> dict[int, tuple[str, str]]:
     seta ``→``, travessão): vale qualquer linha numerada cuja escolha tenha USAR ou EXISTE.
     """
     out = {}
-    for m in re.finditer(r"^\W*(\d+)\W*\s+(.*)$", text, re.M):
+    # linha numerada, ou correção no meio do texto ("Veredito: 8 -> NAO EXISTE - …"); na ordem do texto
+    found = [*re.finditer(r"^\W*(\d+)\W*\s+(.*)$", text, re.M),
+             *re.finditer(r"(?<=[ :])(\d+)\s*(?:->|→|=>)(.*)$", text, re.M)]
+    for m in sorted(found, key=lambda m: m.start()):
         rest = re.sub(r"\s[–—]\s", " - ", m.group(2))
         rest = re.split(r"->|→|=>", rest)[-1]
         choice, _, why = rest.partition(" - ")
@@ -170,7 +177,8 @@ def _pick(choice: str, cands: list[Match]) -> Match | None:
     """Só aceita candidata listada daquele item (guarda contra apontar a própria função ou inventar)."""
     norm = choice.replace("\\", "/")
     hits = [c for c in cands if re.search(rf"\b{re.escape(c.qualname.rsplit('.', 1)[-1])}\b", norm)]
-    return next((c for c in hits if c.path in norm), hits[0] if len(hits) == 1 else None)
+    return (next((c for c in hits if c.path in norm), hits[0] if len(hits) == 1 else None)
+            or next((c for c in cands if f"{c.path}:{c.lineno}" in norm), None))  # só arquivo:linha, sem o nome
 
 
 def _excerpt(src: str, n: int) -> str:
@@ -197,7 +205,7 @@ def _ask_items(idx: Index, asks: list, runner: Runner) -> dict[int, tuple[str, s
         blocks = []
         for c in cands:
             got = _find(idx.root, c.path, c.qualname)
-            hint = " (resultado numérico quase igual: até 5% de diferença)" if c.kind == "execucao~" else ""
+            hint = " (rodando as duas em entradas de teste, o resultado é quase igual)" if c.kind == "execucao~" else ""
             blocks.append(f"- {c.path}:{c.lineno} {c.qualname}{hint}\n```python\n"
                           f"{_excerpt(got[1], REVIEW_LINES) if got else ''}\n```")
         parts.append(f"## {i}. NOVA: {f.qualname}\n```python\n{(mine[1] if mine else '')[:1500]}\n```\n"
