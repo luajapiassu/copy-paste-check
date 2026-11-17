@@ -466,3 +466,8 @@ def test_parse_review_correcao_no_meio_do_texto():
     from copy_paste_check.index import Match
     cands = [Match("vocab", 1.0, "a/b.py", "make", 86), Match("vocab", 1.0, "a/c.py", "outra", 3)]
     assert judge._pick(got[7][0], cands).qualname == "make"
+
+
+def test_parse_veredito_no_fim():
+    got = judge._parse_review("1 | f faz o mesmo; só muda o nome | USAR a.py:3 f\n2 | g usa dias corridos | NAO EXISTE")
+    assert got == {1: ("USAR a.py:3 f", "f faz o mesmo; só muda o nome"), 2: ("NAO EXISTE", "g usa dias corridos")}
