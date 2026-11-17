@@ -127,12 +127,11 @@ REVIEW_SYSTEM = (
     "diário, renda fixa x fundo), outra operação sobre o mesmo dado (ler x gravar, criar x apagar, listar x "
     "buscar um), outra entidade ou tabela, ou só o mesmo esqueleto (CRUD, endpoint, delete+404) sobre coisas "
     "diferentes. A própria função nova nunca é resposta. Saída: uma linha por item, exatamente: "
-    "'<n> -> USAR arq:linha nome - ressalva' ou '<n> -> NAO EXISTE - o que a mais próxima faz de diferente' (até 20 "
-    "palavras). Decida assim: ache a candidata mais próxima e diga que diferença ela tem no resultado ou no efeito; "
-    "se a diferença é das que não contam, ou se não há diferença (você escreveria 'faz o mesmo', 'idêntica', 'mesma "
-    "regra'), o veredito é USAR. A linha começa pelo veredito final; não escreva USAR se a conclusão for que é "
-    "outra coisa, nem NAO EXISTE se a mais próxima faz a mesma coisa. Responda direto, sem preâmbulo."
-)
+    "'<n> | nome da candidata mais próxima e a diferença dela no resultado ou no efeito, ou \"nenhuma\" (até 20 "
+    "palavras) | USAR arq:linha nome' ou a mesma linha terminando em '| NAO EXISTE'. O veredito vem por último e "
+    "segue do que você acabou de escrever: diferença das que não contam, ou nenhuma (você escreveu 'faz o mesmo', "
+    "'idêntica', 'mesma regra') = USAR; número ou efeito diferente = NAO EXISTE. Responda direto, sem preâmbulo."
+)  # veredito no fim: com ele no começo o Haiku escrevia "NAO EXISTE - ... faz o mesmo" (4 de 5 erros, 2026-11-16)
 REVIEW_LINES = 12  # linhas de cada candidata no prompt; com 6 o Haiku errou 4/9 (2026-11-12)
 # ponytail: abaixo disso é getter. Medido: "tirar acento" = 30 tokens, dia útil com feriados = 20,
 # `d.weekday() < 5` = 11. Com 10 entram ~8% mais funções (268 de 3.175 num repositório real).
@@ -166,8 +165,11 @@ def _parse_review(text: str) -> dict[int, tuple[str, str]]:
     for m in sorted(found, key=lambda m: m.start()):
         rest = re.sub(r"\s[–—]\s", " - ", m.group(2))
         rest = re.split(r"->|→|=>", rest)[-1]
-        choice, _, why = rest.partition(" - ")
-        choice = choice.strip(" []*")
+        if "|" in rest:  # formato atual: "n | diferença | veredito"
+            why, _, choice = rest.rpartition("|")
+        else:
+            choice, _, why = rest.partition(" - ")
+        choice, why = choice.strip(" []*"), why.strip(" |")
         if re.search(r"USAR|EXISTE", _sem_acento(choice)):
             out[int(m.group(1))] = (choice, why.strip())
     return out

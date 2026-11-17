@@ -37,18 +37,20 @@ Medido em um repositório Python real (~850 arquivos, ~6.700 funções):
   - Aceitar candidata mostrada em outro item da mesma chamada.
 
 - Segundo repositório (gabarito de 11 casos, nunca usado para ajustar o prompt): 5/11 na primeira rodada. O modelo respondia "NAO EXISTE - a mais próxima faz o mesmo". Três ajustes levaram a 9–11/11 sem piorar o primeiro (18–20/20): dizer no prompt que sem diferença apontável o veredito é USAR; ler correção feita no meio da resposta; teto de pensamento de 2048 para 8000 (mesmo total de tokens).
+- Veredito no fim da linha (`n | diferença | veredito`): o modelo escrevia `NAO EXISTE` no começo e "faz o mesmo" na justificativa (4 de 5 erros em 6 rodadas). Com o veredito depois da diferença, 5 erros em 93 julgamentos caíram para 2 em 93 (amostra pequena). Nenhum alarme falso nas 12 rodadas.
 - O julgamento **oscila entre rodadas**: 1 ou 2 casos de fronteira mudam de lado com o mesmo código. Os termos de busca sugeridos pelo modelo também variam, e uma candidata pode não aparecer numa rodada.
 - `ask` sem modelo, 9 pedidos em português: a função certa veio entre as 4 primeiras em 6. Erra quando o pedido está em português e o nome em inglês ("é dia útil" x `_is_business_day`).
 
 ## Pendente
 
 - [ ] Oscilação do julgamento: medir cada gabarito em 5 rodadas e testar lotes menores ou segunda opinião só nos itens `NAO EXISTE` com candidata forte.
+- [ ] Alarme falso (`USAR` apontando função que não serve): não apareceu no bench, mas o gabarito só tem 9 casos negativos escritos à mão. Medir em uso real (anotar cada aviso como usado / falso positivo) e virar caso novo no gabarito cada alarme falso, sobretudo funções de mesmo esqueleto (CRUD, endpoint, leitura de planilha).
 - [ ] Gabarito ainda pequeno (20 + 11 casos, dois repositórios do mesmo time). Par que escapar em PR real vira caso novo.
 - [ ] `ask`: não cruza português e inglês (o `review` cruza com uma chamada curta ao modelo; o `ask` não, para custar zero).
 - [ ] Execução: 39 das 147 funções puras do repositório de teste ainda não rodam (pedem dicionário, lista de registros ou objeto do projeto).
 - [ ] `near` em pares curtos com cláusula extra fica abaixo do ruído (xfail em `tests/labeled_near.py`); hoje quem pega esse caso é o `review`.
 - [ ] TS/TSX: hoje só Python.
-- [ ] Distribuição: biblioteca fixada por tag ou plugin do Claude Code.
+- [ ] Distribuição: hoje é instalar direto do repositório (`uv pip install "git+https://github.com/luajapiassu/copy-paste-check"`); tag ou plugin só se a main instável virar problema.
 
 ## Fora de escopo (por ora)
 
