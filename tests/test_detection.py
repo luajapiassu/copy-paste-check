@@ -117,6 +117,19 @@ def test_formula_constants_matter():
     assert anual_252 and anual_252 != anual_365
 
 
+def test_formula_iloc_e_cast():
+    """``float(s.iloc[-1] / s.iloc[0] - 1)`` é a mesma conta de ``a / b - 1``."""
+    base = canon("def r(a, b):\n    return a / b - 1\n")
+    assert base
+    assert canon("def r(s):\n    return float(s.iloc[-1] / s.iloc[0] - 1)\n") == base
+    assert canon("def r(s):\n    return (s.iloc[-1] - s.iloc[0]) / s.iloc[0]\n") == base
+
+
+def test_formula_cast_nao_esconde_outra_conta():
+    a = canon("def r(s):\n    return float(s.iloc[-1] / s.iloc[0] - 1)\n")
+    assert a != canon("def r(s):\n    return float(s.iloc[-1] / s.iloc[0] + 1)\n")
+
+
 def test_syntax_error_returns_empty():
     assert extract_functions("def (:", "x.py") == []
 
@@ -205,6 +218,33 @@ def test_hook_warns_formula_post(repo: Path):
                     "tool_input": {"file_path": str(new), "content": new.read_text()}})
     ctx = out["hookSpecificOutput"]["additionalContext"]
     assert "formula" in ctx and "retorno_simples" in ctx
+
+
+def _log(repo: Path) -> list[dict]:
+    f = repo / ".cpcheck" / "hook.log"
+    return [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines()] if f.exists() else []
+
+
+def test_hook_log_registra_execucao_com_achado(repo: Path):
+    content = ORIGINAL.replace("media_ponderada", "wavg")
+    run_hook({"hook_event_name": "PreToolUse", "tool_name": "Write",
+              "tool_input": {"file_path": str(repo / "novo.py"), "content": content}})
+    (rec,) = _log(repo)
+    assert rec["evento"] == "PreToolUse" and rec["arquivo"] == "novo.py"
+    assert rec["checadas"] >= 1 and rec["achados"] == ["exact"] and rec["nivel"] == "block"
+
+
+def test_hook_log_registra_silencio_e_funcao_pequena(repo: Path):
+    run_hook({"hook_event_name": "PreToolUse", "tool_name": "Write",
+              "tool_input": {"file_path": str(repo / "novo.py"), "content": "def oi(n):\n    return n\n"}})
+    (rec,) = _log(repo)
+    assert rec["checadas"] == 0 and rec["achados"] == [] and rec["nivel"] == ""
+
+
+def test_hook_log_ignora_nao_python(repo: Path):
+    run_hook({"hook_event_name": "PreToolUse", "tool_name": "Write",
+              "tool_input": {"file_path": str(repo / "a.ts"), "content": "x"}})
+    assert _log(repo) == []
 
 
 def test_hook_skips_non_python(repo: Path):
