@@ -32,6 +32,7 @@ MIN_WEIGHT_RETURN = 2
 MIN_WEIGHT_INLINE = 3
 MAX_SYMBOLS = 6
 _TRIVIAL = {0, 1, -1, 2}
+_CASTS = {"float", "Decimal"}  # int() trunca: muda a conta
 _MATH = {"log": "log", "exp": "exp", "sqrt": "sqrt", "abs": "Abs", "fabs": "Abs", "sin": "sin", "cos": "cos"}
 # Métodos/funções de agregação que viram uma função simbólica opaca f(x).
 _OPAQUE = {
@@ -57,6 +58,17 @@ class _NotFormula(Exception):
     pass
 
 
+def _int_index(node: ast.AST) -> int | None:
+    if not isinstance(node, ast.Subscript):
+        return None
+    sl = node.slice
+    neg = isinstance(sl, ast.UnaryOp) and isinstance(sl.op, ast.USub)
+    sl = sl.operand if neg else sl
+    if isinstance(sl, ast.Constant) and isinstance(sl.value, int) and not isinstance(sl.value, bool):
+        return -sl.value if neg else sl.value
+    return None
+
+
 def _ref_name(node: ast.AST) -> str:
     """``df.close``, ``df["close"]`` e ``self.df.close`` viram nomes de símbolo estáveis."""
     if isinstance(node, ast.Name):
@@ -65,6 +77,9 @@ def _ref_name(node: ast.AST) -> str:
         return f"{_ref_name(node.value)}.{node.attr}"
     if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
         return f"{_ref_name(node.value)}.{node.slice.value}"
+    idx = _int_index(node)
+    if idx is not None:  # s.iloc[-1], x[0]: posição fixa é um símbolo, não uma conta
+        return f"{_ref_name(node.value)}[{idx}]"
     raise _NotFormula
 
 
@@ -109,6 +124,8 @@ class _Converter:
 
     def _call(self, node: ast.Call):
         func = node.func
+        if isinstance(func, ast.Name) and func.id in _CASTS and len(node.args) == 1 and not node.keywords:
+            return self(node.args[0])  # float(a / b - 1) é a mesma conta de a / b - 1
         fname = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
         if fname is None:
             raise _NotFormula

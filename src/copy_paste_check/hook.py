@@ -14,6 +14,7 @@ Uma ``def`` com ``# cpcheck: ignore`` na mesma linha ou na anterior é ignorada.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 import os
 import sqlite3
 import sys
@@ -71,7 +72,7 @@ def new_or_changed(before: str, after: str, rel: str, min_tokens: int, formulas:
 
 
 def check_change(event: str, tool: str, inp: dict, mode: str, limit: int = 3,
-                 response=None) -> tuple[str, list[str]] | None:
+                 response=None, stats: dict | None = None) -> tuple[str, list[str]] | None:
     """Devolve (nível, linhas) — nível é ``block`` ou ``warn`` — ou None."""
     file_path = inp.get("file_path", "")
     if not file_path.endswith(".py"):
@@ -98,6 +99,8 @@ def check_change(event: str, tool: str, inp: dict, mode: str, limit: int = 3,
                         if m.path != rel or m.qualname in stays - {f.qualname})
     finally:
         idx.close()
+    if stats is not None:  # alimenta o hook.log: o que foi checado, mesmo quando nada foi achado
+        stats.update(root=root, arquivo=rel, checadas=len(funcs), achados=sorted({m.kind for _, m in hits}))
 
     strong = [(f, m) for f, m in hits if m.kind in STRONG]
     weak = [(f, m) for f, m in hits if m.kind not in STRONG]
@@ -119,6 +122,20 @@ def check_change(event: str, tool: str, inp: dict, mode: str, limit: int = 3,
     return level, lines
 
 
+def _log(stats: dict, event: str, mode: str, level: str) -> None:
+    """Uma linha JSON por execução em ``.cpcheck/hook.log``: sem isso não dá para saber se o hook
+    rodou e não achou nada ou se nem olhou (``checadas`` = 0: função pequena ou nada novo)."""
+    if "root" not in stats:
+        return
+    rec = {"t": datetime.now().isoformat(timespec="seconds"), "evento": event, "modo": mode,
+           "arquivo": stats["arquivo"], "checadas": stats["checadas"], "achados": stats["achados"], "nivel": level}
+    try:
+        with open(Path(stats["root"]) / ".cpcheck" / "hook.log", "a", encoding="utf-8") as f:
+            print(json.dumps(rec, ensure_ascii=False), file=f)
+    except OSError:  # log nunca pode travar o agente
+        pass
+
+
 def run(stream=sys.stdin) -> int:
     try:
         payload = json.load(stream)
@@ -129,12 +146,14 @@ def run(stream=sys.stdin) -> int:
     if tool not in ("Write", "Edit", "MultiEdit"):
         return 0
     mode = os.environ.get("CPCHECK_MODE", "block")
+    stats: dict = {}
     try:
         result = check_change(event, tool, payload.get("tool_input") or {}, mode,
-                              response=payload.get("tool_response"))
+                              response=payload.get("tool_response"), stats=stats)
     except Exception as exc:  # o hook nunca pode travar o agente
         print(f"cpcheck: erro ignorado ({type(exc).__name__}: {exc})", file=sys.stderr)
         return 0
+    _log(stats, event, mode, result[0] if result else "")
     if result is None:
         return 0
     level, lines = result
